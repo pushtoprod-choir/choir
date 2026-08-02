@@ -1,0 +1,53 @@
+import os
+from dotenv import load_dotenv
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+from choir.store.profiles import init_db
+from choir.bot.handlers import handle_choir_command, track_group_member
+from choir.bot.onboarding import (
+    start_onboarding,
+    handle_budget,
+    handle_preferences,
+    handle_area,
+    cancel_onboarding,
+    BUDGET,
+    PREFERENCES,
+    AREA,
+)
+
+load_dotenv()
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("choir", handle_choir_command))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, track_group_member), group=1)
+
+    onboarding_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start_onboarding, filters=filters.ChatType.PRIVATE)],
+        states={
+            BUDGET: [CallbackQueryHandler(handle_budget, pattern="^budget_")],
+            PREFERENCES: [CallbackQueryHandler(handle_preferences, pattern="^pref_")],
+            AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_area)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_onboarding)],
+    )
+    app.add_handler(onboarding_handler)
+
+    print("Bot is running... press Ctrl+C to stop")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
