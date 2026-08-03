@@ -35,6 +35,9 @@ class NegotiationResult:
     explanation: Optional[str]     # e.g. "Chose the cafe over the bar — Rahul's saving money this week"
     top_options: list[str] = field(default_factory=list)  # populated only if converged == False
     tradeoffs: list[str] = field(default_factory=list)    # per-person reasons, populated on convergence
+    rounds: list[list[AgentSignal]] = field(default_factory=list)  # every round's signals, always populated —
+                                                                    # lets the bot show the actual back-and-forth,
+                                                                    # not just the final outcome
 
 
 @dataclass

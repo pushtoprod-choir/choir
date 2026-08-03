@@ -3,7 +3,7 @@ from telegram.ext import ContextTypes
 
 from choir.store.profiles import get_profile, record_seen_member, get_seen_members
 from choir.schemas import NegotiationRequest, AgentSignal
-from choir.engine.orchestrator import run_negotiation
+from choir.engine.orchestrator import format_transcript, run_negotiation
 
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -81,3 +81,8 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         options_text = "\n".join(f"- {opt}" for opt in result.top_options)
         await message.reply_text(f"Couldn't fully agree — here are the top options:\n{options_text}")
+
+    # The proof this was a real negotiation, not a single hidden API call —
+    # sent as a follow-up so the main decision stays the headline message.
+    if result.rounds:
+        await message.reply_text("See how we got here:\n\n" + format_transcript(result.rounds))
