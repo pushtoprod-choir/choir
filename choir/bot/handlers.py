@@ -8,7 +8,7 @@ from choir.engine.orchestrator import run_negotiation
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    if message is None or message.from_user is None:
+    if message is None or message.from_user is None or message.from_user.is_bot:
         return
     record_seen_member(message.chat_id, message.from_user.id)
 
