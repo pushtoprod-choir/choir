@@ -11,7 +11,7 @@ Run: python -m unittest tests/test_orchestrator.py -v
 import unittest
 from unittest.mock import patch
 
-from choir.engine.orchestrator import run_negotiation
+from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.schemas import AgentSignal, NegotiationRequest, UserProfile
 
 USER_A = UserProfile(telegram_user_id=1, budget_min=100, budget_max=300, preferences=[], area="HSR")
@@ -49,6 +49,29 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(result.tradeoffs, ["still works", "fine by me"])
         # on_round fired once per round actually run (2 here), each with both signals
         self.assertEqual(rounds_seen, [(0, 2), (1, 2)])
+        # rounds is the full transcript, always populated regardless of on_round
+        self.assertEqual(len(result.rounds), 2)
+        self.assertEqual(result.rounds[0][0].stance, "COUNTER")
+        self.assertEqual(result.rounds[1][1].stance, "ACCEPT")
+
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_format_transcript_reads_back_the_full_negotiation(self, mock_get):
+        mock_get.side_effect = scripted({
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits my budget", counter_proposal="Cafe A"),
+            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="want to see other options"),
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine by me"),
+        })
+
+        result = run_negotiation(
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B])
+        )
+        transcript = format_transcript(result.rounds)
+
+        self.assertIn("Round 1:", transcript)
+        self.assertIn("Round 2:", transcript)
+        self.assertIn("proposes: Cafe A", transcript)
+        self.assertIn("2: ACCEPT — fine by me", transcript)
 
     @patch("choir.engine.orchestrator.get_agent_response")
     def test_round_one_all_accept_does_not_falsely_converge(self, mock_get):

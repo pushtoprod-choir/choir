@@ -42,6 +42,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
                 decision=current_proposal,
                 explanation=_build_explanation(signals),
                 tradeoffs=_build_tradeoffs(signals),
+                rounds=history,
             )
 
         # Take the first counter-proposal as the next thing on the table.
@@ -62,6 +63,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
         decision=None,
         explanation=None,
         top_options=_extract_top_options(history),
+        rounds=history,
     )
 
 
@@ -87,3 +89,19 @@ def _extract_top_options(history: list[list[AgentSignal]]) -> list[str]:
             if s.counter_proposal and s.counter_proposal not in options:
                 options.append(s.counter_proposal)
     return options[:2]
+
+
+def format_transcript(rounds: list[list[AgentSignal]]) -> str:
+    """Turns NegotiationResult.rounds into a readable "show your work" block —
+    the demo moment that proves the negotiation was real back-and-forth, not
+    a single hidden API call. Pure formatting, no I/O, so it's testable with
+    the same fake AgentSignal objects used everywhere else in this engine."""
+    lines = []
+    for round_num, signals in enumerate(rounds):
+        lines.append(f"Round {round_num + 1}:")
+        for s in signals:
+            line = f"  {s.user_id}: {s.stance} — {s.reason}"
+            if s.counter_proposal:
+                line += f" (proposes: {s.counter_proposal})"
+            lines.append(line)
+    return "\n".join(lines)
