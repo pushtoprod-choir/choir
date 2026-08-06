@@ -1,9 +1,18 @@
+import asyncio
+
 from telegram import Update
+from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
 from choir.store.profiles import get_profile, record_seen_member, get_seen_members
 from choir.schemas import NegotiationRequest, AgentSignal
 from choir.engine.orchestrator import format_transcript, run_negotiation
+
+# Chats with a negotiation currently in flight — guards against a second
+# /choir stomping on a running one (e.g. someone double-tapping the command).
+# Single-threaded event loop, so plain set membership checks are race-free
+# as long as we don't await between the check and the add.
+_active_negotiations: set[int] = set()
 
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15,10 +24,19 @@ async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+
+    if message.chat.type == ChatType.PRIVATE:
+        await message.reply_text("/choir only works in a group — add me to one and try there.")
+        return
+
     goal_text = " ".join(context.args)  # everything after "/choir"
 
     if not goal_text:
         await message.reply_text("Tell me what you want to plan — e.g. /choir plan lunch for us")
+        return
+
+    if message.chat_id in _active_negotiations:
+        await message.reply_text("Already negotiating for this group — hang tight for that one to finish.")
         return
 
     # /choir itself counts as being "seen" in this chat
@@ -38,9 +56,16 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if missing_users:
         bot_username = context.bot.username
         await message.reply_text(
-            f"Some of you haven't set up Choir yet. Tap this and hit Start: "
-            f"t.me/{bot_username}"
+            f"Some of you haven't set up Choir yet — tap this and hit Start: t.me/{bot_username}\n\n"
+            f"Already did that? I can only see people who've sent at least one message in this group — "
+            f"say something here first, then try /choir again."
         )
+        return
+
+    if not profiles:
+        # Defensive — shouldn't happen since the /choir sender is always recorded above,
+        # but a silent no-op is worse than a clear message if it ever does.
+        await message.reply_text("Couldn't find anyone set up in this group yet.")
         return
 
     request = NegotiationRequest(
@@ -61,17 +86,19 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text(f"Round {round_num + 1}: {len(accepted)}/{len(signals)} agreed so far...")
 
     # run_negotiation is synchronous; on_round is a coroutine, so drive it from a sync callback
-    import asyncio
     loop = asyncio.get_event_loop()
 
     def sync_on_round(round_num, signals):
         asyncio.run_coroutine_threadsafe(on_round(round_num, signals), loop)
 
+    _active_negotiations.add(message.chat_id)
     try:
         result = await asyncio.to_thread(run_negotiation, request, sync_on_round)
     except NotImplementedError:
         await message.reply_text("The negotiation engine isn't wired up yet — check back once it's built.")
         return
+    finally:
+        _active_negotiations.discard(message.chat_id)
 
     if result.converged:
         reply = f"{result.decision}\n\n{result.explanation}"
