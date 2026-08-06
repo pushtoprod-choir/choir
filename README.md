@@ -27,7 +27,7 @@ Group outings are the first demo. The underlying primitive, private agents negot
 1. **Trigger.** Someone in a Telegram group types `/choir <what they want to do>`.
 2. **Profile lookup.** Choir pulls each group member's stored profile, long-term preferences (budget range, tastes, general area) plus anything temporary they've mentioned for this specific plan ("I'm saving money this month").
 3. **Negotiation.** Each person's agent proposes and reacts on their behalf. Agents exchange minimal-disclosure signals (`ACCEPT` / `REJECT` / `COUNTER-PROPOSE` + a reason), never raw private data. The orchestrator runs this until every agent actually agrees, or, if there's a genuine conflict, narrows it to the best 2 options and hands it back to the group instead of faking a decision nobody wants.
-4. **Venue sourcing.** For outings specifically, Choir first figures out the purpose of the meetup (casual lunch, drinks, a work catch-up all want different things from a venue), then pulls real options from Google Places around a fair midpoint of everyone's stated area.
+4. **Venue sourcing.** For outings specifically, Choir first figures out the purpose of the meetup (casual lunch, drinks, a work catch-up all want different things from a venue), then pulls real options from LocationIQ around a fair midpoint of everyone's stated area.
 5. **Outcome.** The group gets one message: the decision, plus why.
 
 ## Onboarding — "Meet Your Representative"
@@ -60,7 +60,7 @@ choir/
 | Language | Python |
 | Bot framework | [`python-telegram-bot`](https://github.com/python-telegram-bot/python-telegram-bot) |
 | Reasoning | Claude, via the [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python) |
-| Venue data | Google Places API |
+| Venue data | LocationIQ (OpenStreetMap-backed) |
 | Storage | SQLite (hackathon scope) |
 | Transport | Long polling (no public server required) |
 
@@ -70,7 +70,7 @@ choir/
 - Python 3.10+
 - A Telegram account
 - An [Anthropic API key](https://console.anthropic.com)
-- A [Google Cloud](https://console.cloud.google.com) project with the Places API enabled
+- A [LocationIQ](https://locationiq.com) API key (free tier is enough)
 
 ### 2. Create the Telegram bot
 1. Message [`@BotFather`](https://t.me/BotFather) on Telegram
@@ -91,7 +91,7 @@ Copy `.env.example` to `.env` and fill in:
 ```
 TELEGRAM_BOT_TOKEN=
 ANTHROPIC_API_KEY=
-GOOGLE_PLACES_API_KEY=
+LOCATION_IQ_API_KEY=
 ```
 
 ### 5. Run it

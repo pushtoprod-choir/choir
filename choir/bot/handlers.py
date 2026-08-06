@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from telegram import Update
 from telegram.constants import ChatType
@@ -7,6 +8,7 @@ from telegram.ext import ContextTypes
 from choir.store.profiles import get_profile, record_seen_member, get_seen_members
 from choir.schemas import NegotiationRequest, AgentSignal
 from choir.engine.orchestrator import format_transcript, run_negotiation
+from choir.venues.places import build_venue_query, find_venues
 
 # Chats with a negotiation currently in flight — guards against a second
 # /choir stomping on a running one (e.g. someone double-tapping the command).
@@ -100,14 +102,23 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     finally:
         _active_negotiations.discard(message.chat_id)
 
+    # Grounds the negotiated decision in real, nearby places. Best-effort —
+    # find_venues() already fails soft on lookup problems, so a flaky venue
+    # API should never take down the core negotiation result.
+    venue_query = build_venue_query(profiles, goal_text)
+    venues = await asyncio.to_thread(find_venues, venue_query, os.environ["LOCATION_IQ_API_KEY"])
+    venues_text = ""
+    if venues:
+        venues_text = "\n\nReal options nearby:\n" + "\n".join(f"- {v.name} ({v.address})" for v in venues)
+
     if result.converged:
         reply = f"{result.decision}\n\n{result.explanation}"
         if result.tradeoffs:
             reply += "\n\nWhy:\n" + "\n".join(f"- {t}" for t in result.tradeoffs)
-        await message.reply_text(reply)
+        await message.reply_text(reply + venues_text)
     else:
         options_text = "\n".join(f"- {opt}" for opt in result.top_options)
-        await message.reply_text(f"Couldn't fully agree — here are the top options:\n{options_text}")
+        await message.reply_text(f"Couldn't fully agree — here are the top options:\n{options_text}{venues_text}")
 
     # The proof this was a real negotiation, not a single hidden API call —
     # sent as a follow-up so the main decision stays the headline message.
