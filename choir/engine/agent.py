@@ -14,7 +14,8 @@ from choir.schemas import AgentSignal, UserProfile
 
 client = Anthropic()
 
-MODEL = "claude-sonnet-5"
+MODEL = "claude-haiku-4-5"
+# MODEL = "claude-sonnet-5"
 
 # Claude's reply must match this shape exactly. This is why we don't hand-parse
 # "ACCEPT: <reason>" strings the way the original plan sketch did — a malformed
@@ -77,9 +78,11 @@ Otherwise leave "counter_proposal" null."""
             # This is a quick single-turn classification-style decision, not an
             # open-ended reasoning task, so we skip thinking for latency — a
             # negotiation round calls this once per person, several times over.
+            # No output_config.effort here: Haiku 4.5 doesn't support it at all
+            # (400s on any value), unlike Sonnet 5 / Opus-tier — structured
+            # outputs alone (the "format" below) are enough for this model.
             thinking={"type": "disabled"},
             output_config={
-                "effort": "low",
                 "format": {"type": "json_schema", "schema": RESPONSE_SCHEMA},
             },
             messages=[{"role": "user", "content": user_message}],
