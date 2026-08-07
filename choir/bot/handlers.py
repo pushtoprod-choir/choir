@@ -1,14 +1,16 @@
 import asyncio
+import logging
 import os
 
 from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
 
-from choir.store.profiles import get_profile, record_seen_member, get_seen_members
+from choir.store.profiles import get_profile, record_seen_member, get_seen_members, get_member_name
 from choir.schemas import NegotiationRequest, AgentSignal
 from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.venues.places import build_venue_query, find_venues
+from choir.venues.enrichment import enrich_venues
 
 # Chats with a negotiation currently in flight — guards against a second
 # /choir stomping on a running one (e.g. someone double-tapping the command).
@@ -21,7 +23,7 @@ async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.message
     if message is None or message.from_user is None or message.from_user.is_bot:
         return
-    record_seen_member(message.chat_id, message.from_user.id)
+    record_seen_member(message.chat_id, message.from_user.id, message.from_user.first_name)
 
 
 async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42,7 +44,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # /choir itself counts as being "seen" in this chat
-    record_seen_member(message.chat_id, message.from_user.id)
+    record_seen_member(message.chat_id, message.from_user.id, message.from_user.first_name)
 
     member_ids = get_seen_members(message.chat_id)
     profiles = []
@@ -77,15 +79,16 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
-        countered = [s for s in signals if s.stance == "COUNTER"]
-        accepted = [s for s in signals if s.stance == "ACCEPT"]
-        if countered:
-            await message.reply_text(
-                f"Round {round_num + 1}: {len(accepted)}/{len(signals)} agreed so far — "
-                f"someone's countering with a new idea..."
-            )
-        else:
-            await message.reply_text(f"Round {round_num + 1}: {len(accepted)}/{len(signals)} agreed so far...")
+        lines = [f"Round {round_num + 1}:"]
+        for s in signals:
+            name = get_member_name(message.chat_id, s.user_id) or f"User {s.user_id}"
+            if s.stance == "ACCEPT":
+                lines.append(f"  {name}: accepted")
+            elif s.stance == "COUNTER":
+                lines.append(f"  {name}: countered — {s.reason}")
+            else:
+                lines.append(f"  {name}: rejected — {s.reason}")
+        await message.reply_text("\n".join(lines))
 
     # run_negotiation is synchronous; on_round is a coroutine, so drive it from a sync callback
     loop = asyncio.get_event_loop()
@@ -107,9 +110,13 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # API should never take down the core negotiation result.
     venue_query = build_venue_query(profiles, goal_text)
     venues = await asyncio.to_thread(find_venues, venue_query, os.environ["LOCATION_IQ_API_KEY"])
+    if venues:
+        venues = await asyncio.to_thread(enrich_venues, venues, venue_query.purpose)
     venues_text = ""
     if venues:
-        venues_text = "\n\nReal options nearby:\n" + "\n".join(f"- {v.name} ({v.address})" for v in venues)
+        venues_text = "\n\nReal options nearby:\n" + "\n".join(
+            f"- {v.name} ({v.address})" + (f" — {v.note}" if v.note else "") for v in venues
+        )
 
     if result.converged:
         reply = f"{result.decision}\n\n{result.explanation}"
@@ -123,4 +130,10 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # The proof this was a real negotiation, not a single hidden API call —
     # sent as a follow-up so the main decision stays the headline message.
     if result.rounds:
-        await message.reply_text("See how we got here:\n\n" + format_transcript(result.rounds))
+        transcript = format_transcript(result.rounds)
+        if len(transcript) > 3500:
+            transcript = format_transcript(result.rounds[-2:]) + "\n\n(earlier rounds omitted for length)"
+        try:
+            await message.reply_text("See how we got here:\n\n" + transcript)
+        except Exception:
+            logging.exception("Failed to send negotiation transcript")

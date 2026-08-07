@@ -25,6 +25,13 @@ def init_db():
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    # seen_members may already exist from before first_name was added — ALTER
+    # rather than rely on CREATE TABLE IF NOT EXISTS, which won't add columns
+    # to an existing table.
+    try:
+        conn.execute("ALTER TABLE seen_members ADD COLUMN first_name TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -62,9 +69,17 @@ def clear_temporary_context(telegram_user_id: int):
     conn.close()
 
 
-def record_seen_member(chat_id: int, user_id: int):
+def record_seen_member(chat_id: int, user_id: int, first_name: str | None = None):
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR IGNORE INTO seen_members (chat_id, user_id) VALUES (?, ?)", (chat_id, user_id))
+    conn.execute(
+        "INSERT OR IGNORE INTO seen_members (chat_id, user_id, first_name) VALUES (?, ?, ?)",
+        (chat_id, user_id, first_name),
+    )
+    if first_name is not None:
+        conn.execute(
+            "UPDATE seen_members SET first_name = ? WHERE chat_id = ? AND user_id = ?",
+            (first_name, chat_id, user_id),
+        )
     conn.commit()
     conn.close()
 
@@ -74,3 +89,13 @@ def get_seen_members(chat_id: int) -> list[int]:
     rows = conn.execute("SELECT user_id FROM seen_members WHERE chat_id = ?", (chat_id,)).fetchall()
     conn.close()
     return [row[0] for row in rows]
+
+
+def get_member_name(chat_id: int, user_id: int) -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT first_name FROM seen_members WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None

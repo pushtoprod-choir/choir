@@ -53,3 +53,4 @@ class VenueResult:
     address: str
     rating: float
     price_level: int
+    note: Optional[str] = None   # best-effort rating/price/vibe note from enrichment; None if unavailable
