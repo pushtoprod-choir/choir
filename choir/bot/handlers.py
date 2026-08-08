@@ -30,7 +30,7 @@ from choir.store.profiles import (
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
 from choir.engine.agent import get_missing_info_question
 from choir.engine.orchestrator import format_transcript, run_negotiation
-from choir.venues.places import build_venue_query, find_venues, geocode_areas, haversine_distance_km
+from choir.venues.places import build_venue_query, find_venues, haversine_distance_km
 from choir.venues.enrichment import enrich_venues
 from choir.actions.links import build_ride_deeplink, describe_ride_suggestion, find_carpool_pairs
 from choir.bot.intent import is_planning_request
@@ -72,6 +72,15 @@ _last_negotiation_id: dict[int, int] = {}
 # "/choir update <reason>" unless the reason itself names a new date — most
 # revisions (a venue swap, someone running late) don't touch the date at all.
 _last_plan_date: dict[int, str] = {}
+
+# chat_id -> that decision's decided_time. A later "/choir update" seeds the
+# new negotiation's starting proposal+time with BOTH of these instead of
+# discarding the time and starting the whole thing blank — without this, an
+# update that only affects one person (e.g. "Pragathi can't make it") reset
+# every OTHER person's negotiation to a blank slate too, which is what let
+# agents with no real conflict invent one: nothing on the table meant nothing
+# to just re-confirm, so every agent had to manufacture a fresh position.
+_last_decided_time: dict[int, str] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
 
@@ -212,30 +221,51 @@ def _format_plan_datetime(plan_date: str, decided_time: str) -> str:
     return f"{date_part} at {time_part}"
 
 
-async def _send_ride_suggestions(chat_id: int, profiles: list[UserProfile], venue: VenueResult, bot) -> None:
+async def _send_ride_suggestions(
+    chat_id: int,
+    profiles: list[UserProfile],
+    venue: VenueResult,
+    bot,
+    area_coords: dict[str, tuple[float, float] | None],
+) -> None:
     """Best-effort, DM-only ride-suggestion stub — not a real booking, just a
     pre-filled Uber deep link plus a distance-based carpool nudge, sent
     privately (pickup area is personal, same reasoning as budget). Skips
-    entirely if LocationIQ isn't configured or the venue has no real
-    coordinates; a failed DM to one person never blocks another's."""
-    location_iq_key = os.environ.get("LOCATION_IQ_API_KEY")
-    if not location_iq_key or not (venue.lat and venue.lon):
+    entirely if the venue has no real coordinates; a failed DM to one person
+    never blocks another's.
+
+    area_coords is reused from the negotiation's own geocoding pass
+    (NegotiationResult.area_coords, populated by orchestrator._fetch_venue_context)
+    rather than re-geocoded here — a second independent LocationIQ burst
+    moments after the first risked hitting a rate limit or transient failure
+    for whoever's area came up in it, silently giving that person no ride
+    suggestion at all with nothing logged anywhere to explain why."""
+    if not (venue.lat and venue.lon):
+        return
+    if not area_coords:
+        logging.warning("No area_coords available for ride suggestions: chat=%s", chat_id)
         return
 
-    areas = list({p.area for p in profiles})
-    area_coords = await asyncio.to_thread(geocode_areas, areas, location_iq_key)
     dropoff = (venue.lat, venue.lon)
 
     user_coords: dict[int, tuple[float, float]] = {}
     for profile in profiles:
         pickup = area_coords.get(profile.area)
         if pickup is None:
+            logging.warning(
+                "No geocoded coordinate for %r; skipping ride suggestion for user %s",
+                profile.area, profile.telegram_user_id,
+            )
             continue
         user_coords[profile.telegram_user_id] = pickup
 
         distance = haversine_distance_km(pickup, dropoff)
         text = describe_ride_suggestion(distance, build_ride_deeplink(pickup, dropoff))
         if not text:
+            logging.info(
+                "Ride suggestion skipped (within walk distance): user=%s distance=%.2fkm",
+                profile.telegram_user_id, distance,
+            )
             continue
         try:
             await bot.send_message(chat_id=profile.telegram_user_id, text=text)
@@ -512,6 +542,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         previous = _last_decision.get(message.chat_id)
         previous_negotiation_id = _last_negotiation_id.get(message.chat_id)
         previous_plan_date = _last_plan_date.get(message.chat_id)
+        previous_decided_time = _last_decided_time.get(message.chat_id)
         if previous is None:
             # In-memory state doesn't survive a restart — the persisted log
             # does. Falls back to it so "/choir update" still works after
@@ -525,6 +556,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 previous = match["decision"]
                 previous_negotiation_id = match["id"]
                 previous_plan_date = match["plan_date"]
+                previous_decided_time = match["decided_time"]
         if previous is None:
             await message.reply_text(
                 "There's no previous plan for this group to update yet — use /choir plan <what you want> to start one.",
@@ -563,6 +595,12 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await _run_negotiation(
             message, goal_text, plan_date, skip_dynamic_questions=True,
             replaces_negotiation_id=previous_negotiation_id,
+            # Seeds round 0 with the PREVIOUS decision (venue + time) already
+            # on the table, instead of starting blank — someone whose
+            # situation didn't change just re-confirms it; only whoever the
+            # revision reason actually concerns has a real reason to counter.
+            initial_proposal=previous,
+            initial_time=previous_decided_time,
         )
         return
 
@@ -639,12 +677,19 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
 async def _run_negotiation(
     message, goal_text: str, plan_date: str, skip_dynamic_questions: bool = False,
     replaces_negotiation_id: int | None = None,
+    initial_proposal: str | None = None,
+    initial_time: str | None = None,
 ):
     """replaces_negotiation_id, when set (only by the /choir update path),
     is the negotiation whose calendar events (if any) should be deleted once
     this one produces a new decision — see the calendar-replace block below.
     A plain new /choir plan on an unrelated topic leaves this None, since
-    that's a separate plan, not a revision of an existing one."""
+    that's a separate plan, not a revision of an existing one.
+
+    initial_proposal/initial_time (also only set by /choir update) seed round
+    0 with the previous negotiation's actual decision already on the table,
+    instead of starting from a blank slate — see run_negotiation's docstring
+    in orchestrator.py for why this matters."""
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -711,7 +756,9 @@ async def _run_negotiation(
 
     _active_negotiations.add(message.chat_id)
     try:
-        result = await asyncio.to_thread(run_negotiation, request, sync_on_round)
+        result = await asyncio.to_thread(
+            run_negotiation, request, sync_on_round, initial_proposal, initial_time
+        )
     except NotImplementedError:
         finish_negotiation_log(negotiation_id, converged=False, decision=None)
         await message.reply_text(
@@ -751,6 +798,8 @@ async def _run_negotiation(
         _last_decision[message.chat_id] = result.decision
         _last_negotiation_id[message.chat_id] = negotiation_id
         _last_plan_date[message.chat_id] = plan_date
+        if result.decided_time:
+            _last_decided_time[message.chat_id] = result.decided_time
         reply = (
             f"🎉 *Decision:* {result.decision}\n"
             f"📅 {_format_plan_datetime(plan_date, result.decided_time)}\n\n"
@@ -815,8 +864,16 @@ async def _run_negotiation(
 
         if result.decided_venue:
             # Trailing, best-effort step — runs after the main decision
-            # message so a failure here can never affect or delay it.
-            await _send_ride_suggestions(message.chat_id, profiles, result.decided_venue, message.get_bot())
+            # message so a failure here can never affect or delay it. Reuses
+            # the SAME geocoded coordinates the negotiation already computed
+            # (result.area_coords) instead of re-geocoding every area again
+            # moments later — a second independent LocationIQ burst right
+            # after the first risked a rate-limited/failed lookup for
+            # whoever's area happened to hit it, silently skipping their ride
+            # suggestion with no error surfaced anywhere.
+            await _send_ride_suggestions(
+                message.chat_id, profiles, result.decided_venue, message.get_bot(), result.area_coords
+            )
     else:
         options_text = "\n".join(f"• {opt}" for opt in result.top_options)
         base = f"🤔 *Couldn't fully agree — here are the top options:*\n{options_text}"

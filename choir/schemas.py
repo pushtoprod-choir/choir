@@ -73,6 +73,11 @@ class NegotiationResult:
                                                   # (LocationIQ down/unconfigured) and the decision is still free text
     decided_time: Optional[str] = None  # "HH:MM" 24-hour, the time the group actually converged on — always set
                                          # together with `decision` on convergence, always None otherwise
+    area_coords: dict = field(default_factory=dict)  # area name -> (lat, lon) or None, from the SAME geocoding
+                                         # pass _fetch_venue_context already did for venue-grounding/the distance
+                                         # check — reused by choir.bot.handlers._send_ride_suggestions so it never
+                                         # has to re-geocode (and re-risk a rate-limited/failed lookup) moments
+                                         # after this same data was already fetched once
 
 
 @dataclass

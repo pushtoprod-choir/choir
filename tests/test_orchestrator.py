@@ -461,6 +461,100 @@ class TestVenueGroundedNegotiation(unittest.TestCase):
         self.assertIsNone(result.decided_venue)
         self.assertIsNone(result.decided_time)
 
+    @patch("choir.engine.orchestrator._fetch_venue_context")
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_area_coords_is_carried_through_on_the_result_for_reuse_downstream(self, mock_get, mock_fetch):
+        # choir/bot/handlers.py's _send_ride_suggestions reuses this instead
+        # of re-geocoding every area a second time right after the
+        # negotiation already did it once — regression coverage for that
+        # plumbing, not just that geocoding itself works (see test_places.py).
+        venue = VenueResult(name="Real Cafe", address="HSR", rating=0, price_level=0, lat=12.90, lon=77.60)
+        mock_fetch.return_value = ([venue], {"HSR": (12.90, 77.60)})
+        mock_get.side_effect = scripted({
+            (1, None): AgentSignal(user_id=1, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+        })
+
+        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
+
+        self.assertEqual(result.area_coords, {"HSR": (12.90, 77.60)})
+
+    @patch("choir.engine.orchestrator._fetch_venue_context")
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_area_coords_is_populated_even_when_the_negotiation_does_not_converge(self, mock_get, mock_fetch):
+        mock_fetch.return_value = ([], {"HSR": (12.90, 77.60)})
+        mock_get.side_effect = scripted({
+            (1, None): AgentSignal(user_id=1, stance="REJECT", reason="no"),
+            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="no"),
+        })
+
+        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
+
+        self.assertFalse(result.converged)
+        self.assertEqual(result.area_coords, {"HSR": (12.90, 77.60)})
+
+
+class TestSeededInitialProposal(unittest.TestCase):
+    """initial_proposal/initial_time (used only by /choir update) put a
+    decision already on the table for round 0, instead of every negotiation
+    always starting blank — regression coverage for the fix to agents
+    inventing an unfounded "scheduling conflict" when an update that only
+    concerned ONE person reset everyone else's negotiation to a blank slate
+    too, giving them nothing to just re-confirm."""
+
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_seeded_proposal_and_time_let_everyone_reconfirm_and_converge_round_0(self, mock_get):
+        mock_get.side_effect = scripted({
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works", proposed_time="19:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="still works", proposed_time="19:00"),
+        })
+
+        result = run_negotiation(
+            NegotiationRequest(group_chat_id=0, goal_text="revise", profiles=[USER_A, USER_B], plan_date=PLAN_DATE),
+            initial_proposal="Cafe A",
+            initial_time="19:00",
+        )
+
+        self.assertTrue(result.converged)
+        self.assertEqual(result.decision, "Cafe A")
+        self.assertEqual(result.decided_time, "19:00")
+        # Converged on the very first round — nobody had to invent a fresh
+        # position since something was already on the table to react to.
+        self.assertEqual(len(result.rounds), 1)
+
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_one_persons_objection_still_moves_the_seeded_proposal(self, mock_get):
+        # The whole point: seeding isn't a hard lock-in — someone with a real
+        # reason can still counter it, same as any other round.
+        mock_get.side_effect = scripted({
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="COUNTER", reason="conflict", counter_proposal="Cafe B", proposed_time="20:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            (1, "Cafe B"): AgentSignal(user_id=1, stance="ACCEPT", reason="works now", proposed_time="20:00"),
+            (2, "Cafe B"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="20:00"),
+        })
+
+        result = run_negotiation(
+            NegotiationRequest(group_chat_id=0, goal_text="revise", profiles=[USER_A, USER_B], plan_date=PLAN_DATE),
+            initial_proposal="Cafe A",
+            initial_time="19:00",
+        )
+
+        self.assertTrue(result.converged)
+        self.assertEqual(result.decision, "Cafe B")
+        self.assertEqual(result.decided_time, "20:00")
+
+    def test_no_seed_behaves_exactly_as_before(self):
+        # Default (no /choir update in play) — must still start blank.
+        with patch("choir.engine.orchestrator.get_agent_response") as mock_get:
+            mock_get.side_effect = scripted({
+                (1, None): AgentSignal(user_id=1, stance="REJECT", reason="nothing to accept yet"),
+                (2, None): AgentSignal(user_id=2, stance="REJECT", reason="nothing to accept yet"),
+            })
+            result = run_negotiation(
+                NegotiationRequest(group_chat_id=0, goal_text="plan", profiles=[USER_A, USER_B], plan_date=PLAN_DATE)
+            )
+        self.assertFalse(result.converged)
+
 
 class TestRoundBudget(unittest.TestCase):
     def test_small_groups_get_the_floor(self):

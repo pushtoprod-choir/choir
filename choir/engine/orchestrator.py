@@ -46,7 +46,23 @@ MAX_VENUE_DISTANCE_KM = 15.0
 OnRound = Callable[[int, list[AgentSignal]], None]
 
 
-def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = None) -> NegotiationResult:
+def run_negotiation(
+    request: NegotiationRequest,
+    on_round: Optional[OnRound] = None,
+    initial_proposal: str | None = None,
+    initial_time: str | None = None,
+) -> NegotiationResult:
+    """initial_proposal/initial_time seed what's "on the table" for round 0,
+    instead of always starting blank — this is what lets choir/bot/handlers.py's
+    /choir update carry the PREVIOUS negotiation's actual decision (venue AND
+    time) forward as the starting point, rather than discarding it and
+    reducing the whole prior outcome to a sentence of free text. Without this,
+    every agent re-negotiates from scratch on an update — including people
+    whose situation never changed — which is what let ungrounded "scheduling
+    conflict" claims appear for people with no real conflict: nothing on the
+    table meant nothing to just re-confirm, so every agent had to invent a
+    fresh position instead of reacting to "does this specific change affect
+    you or not"."""
     started = time.monotonic()
     logger.info(
         "Negotiation started: chat=%s people=%d goal=%r",
@@ -61,13 +77,13 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
 
     max_rounds = _round_budget(len(request.profiles))
 
-    current_proposal: str | None = None
+    current_proposal: str | None = initial_proposal
     # Mirrors current_proposal's "on the table" pattern, applied to the
     # meeting time instead of the venue — plan_date is fixed up front (see
     # NegotiationRequest.plan_date), so this is the only other thing that
     # needs converging on. Unlike current_proposal, it's never None once
     # round 0 completes: every agent response always carries a proposed_time.
-    current_time: str | None = None
+    current_time: str | None = initial_time
     # Every round's signals, kept around so a non-convergent negotiation can
     # still surface the best options it saw instead of just giving up empty.
     history: list[list[AgentSignal]] = []
@@ -112,6 +128,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
                     rounds=history,
                     decided_venue=decided_venue,
                     decided_time=current_time,
+                    area_coords=area_coords,
                 )
             # Everyone said ACCEPT, but the deterministic distance check
             # overrode it — don't report a false "unanimous," fall through
@@ -144,6 +161,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
         explanation=None,
         top_options=_extract_top_options(history),
         rounds=history,
+        area_coords=area_coords,
     )
 
 

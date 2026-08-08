@@ -207,7 +207,15 @@ If the calendar line above shows a real conflict with the current proposed
 time, treat it like a hard constraint (REJECT the venue, or propose a
 different proposed_time) — but never restate the other event's title or
 details in your reason, same rule as never restating your exact budget
-numbers."""
+numbers.
+
+Only ever claim a scheduling conflict for YOURSELF if the "Calendar (next
+48h)" line above actually shows a real, specific overlapping event at the
+time in question. If it says "not connected" or shows nothing at that time,
+you have NO calendar conflict — do not invent one, and do not assume you
+have one just because the goal text mentions someone else's schedule
+changing, or because another participant's stance (above, if shown)
+mentioned a conflict of their own. Their conflict is theirs, not yours."""
 
     if current_proposal:
         user_message = f"The group wants to: {goal_text}\nCurrent proposal on the table: {current_proposal}"

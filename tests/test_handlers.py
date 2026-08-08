@@ -50,6 +50,7 @@ class TestOccasionAndTripFlow(unittest.IsolatedAsyncioTestCase):
         handlers._last_decision.clear()
         handlers._last_negotiation_id.clear()
         handlers._last_plan_date.clear()
+        handlers._last_decided_time.clear()
         handlers._processed_update_ids.clear()
         handlers._processed_update_id_order.clear()
 
@@ -231,6 +232,39 @@ class TestOccasionAndTripFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handlers._last_decision[100], "Test Cafe")
         self.assertEqual(handlers._last_negotiation_id[100], 1)  # the mocked start_negotiation_log return value
         self.assertEqual(handlers._last_plan_date[100], PLAN_DATE)
+        self.assertEqual(handlers._last_decided_time[100], "19:00")
+
+    async def test_update_seeds_the_new_negotiation_with_the_prior_decision_and_time(self):
+        # Regression test for agents hallucinating a "scheduling conflict"
+        # for people totally unaffected by an update: without seeding
+        # round 0 with what was already agreed, every agent had to invent a
+        # fresh position from a blank slate instead of just reconfirming.
+        handlers._last_decision[200] = "Cafe Old"
+        handlers._last_negotiation_id[200] = 7
+        handlers._last_plan_date[200] = PLAN_DATE
+        handlers._last_decided_time[200] = "19:00"
+        message = make_message(chat_id=200, text="/choir update someone's running late")
+        await handlers.handle_choir_command(
+            make_update(message), make_context(["update", "someone's", "running", "late"])
+        )
+
+        self.mock_run.assert_called_once()
+        call_args = self.mock_run.call_args
+        self.assertEqual(call_args.args[2], "Cafe Old")   # initial_proposal
+        self.assertEqual(call_args.args[3], "19:00")       # initial_time
+
+    async def test_a_fresh_plan_seeds_nothing(self):
+        # No prior state for this chat at all — a brand new /choir plan must
+        # not seed initial_proposal/initial_time from someone else's leftover
+        # state, or from a previous, unrelated plan.
+        message = make_message(chat_id=100, text="/choir plan lunch")
+        await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
+        reply_message = make_message(chat_id=100, text="skip")
+        await handlers.handle_occasion_reply(make_update(reply_message), None)
+
+        call_args = self.mock_run.call_args
+        self.assertIsNone(call_args.args[2])
+        self.assertIsNone(call_args.args[3])
 
     async def test_a_fresh_unrelated_choir_does_not_touch_prior_calendar_events(self):
         # Only an explicit /choir update should ever trigger calendar
