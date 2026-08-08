@@ -13,6 +13,8 @@ from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.venues.places import build_venue_query, find_venues
 from choir.venues.enrichment import enrich_venues
 from choir.bot.intent import is_planning_request
+from choir.calendar.client import attach_calendar_availability
+from choir.calendar.scheduling import create_events_for_connected
 
 # Chats with a negotiation currently in flight — guards against a second
 # /choir stomping on a running one (e.g. someone double-tapping the command).
@@ -139,6 +141,11 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text("Couldn't find anyone set up in this group yet.", parse_mode=ParseMode.MARKDOWN)
         return
 
+    # Best-effort — attach_calendar_availability leaves calendar_busy_text as
+    # None (its default) for anyone not connected or on any lookup failure,
+    # so this is a no-op for groups where nobody's connected their calendar.
+    await asyncio.to_thread(attach_calendar_availability, profiles)
+
     request = NegotiationRequest(
         group_chat_id=message.chat_id,
         goal_text=goal_text,
@@ -187,6 +194,22 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         reply = f"🎉 *Decision:* {result.decision}\n\n{result.explanation}"
         if result.tradeoffs:
             reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
+
+        # None means nobody in this group is calendar-connected — a true
+        # no-op, keeping this line absent entirely for unconnected groups.
+        calendar_summary = await asyncio.to_thread(
+            create_events_for_connected, profiles, goal_text, result.decision
+        )
+        if calendar_summary is not None:
+            if calendar_summary.extraction_failed:
+                reply += "\n\n📅 Couldn't auto-schedule this — add it to your calendar manually."
+            else:
+                reply += f"\n\n📅 Added to {calendar_summary.created}/{calendar_summary.connected} connected calendars."
+
+        # Computed after the calendar summary is appended, so the venue
+        # budget accounts for that line too instead of risking going over
+        # Telegram's cap the way a fixed-order union of these two branches
+        # would have.
         budget = TELEGRAM_MESSAGE_LIMIT - VENUES_SAFETY_MARGIN - len(reply)
         try:
             await message.reply_text(reply + _build_venues_text(venues, budget), parse_mode=ParseMode.MARKDOWN)
