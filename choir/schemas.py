@@ -12,6 +12,8 @@ class UserProfile:
     dietary_notes: Optional[str] = None
     temporary_context: Optional[str] = None   # e.g. "saving money this month" — cleared after each negotiation
     notes: Optional[str] = None   # free-text "anything else we should know" answer from onboarding
+    calendar_busy_text: Optional[str] = None  # populated at runtime by choir.calendar.client, never persisted —
+                                               # None means "not connected", not "free"
 
 
 @dataclass
@@ -57,3 +59,26 @@ class VenueResult:
     lat: float = 0.0
     lon: float = 0.0
     note: Optional[str] = None   # best-effort rating/price/vibe note from enrichment; None if unavailable
+
+
+@dataclass
+class CalendarTokens:
+    telegram_user_id: int
+    access_token: str
+    refresh_token: str
+    token_expiry: int   # unix timestamp (seconds)
+
+
+@dataclass
+class EventDetails:
+    title: str
+    start_iso: str              # ISO 8601, timezone-aware
+    duration_minutes: int
+    location_text: str
+
+
+@dataclass
+class CalendarCreationSummary:
+    connected: int
+    created: int
+    extraction_failed: bool = False
