@@ -53,6 +53,7 @@ Preferences: {", ".join(profile.preferences) or "none stated"}
 Area: {profile.area}
 Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}
+Additional notes: {profile.notes or "none"}
 
 Decide your stance on the current proposal:
 - ACCEPT only if it genuinely fits this person's budget and preferences. If

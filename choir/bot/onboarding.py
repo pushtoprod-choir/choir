@@ -1,10 +1,11 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, ConversationHandler
 
 from choir.schemas import UserProfile
 from choir.store.profiles import save_profile, record_seen_member
 
-BUDGET, PREFERENCES, AREA, ANYTHING_ELSE = range(4)
+BUDGET, PREFERENCES, AREA, DIETARY, ANYTHING_ELSE = range(5)
 
 PREFERENCE_OPTIONS = {
     "pref_cafe": "cafe_person",
@@ -15,6 +16,28 @@ PREFERENCE_OPTIONS = {
 }
 
 
+def _preferences_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    # Selected tags get a checkmark so tapping one gives immediate visible
+    # feedback instead of the button looking untouched.
+    rows = [
+        [InlineKeyboardButton(
+            f"✅ {tag.replace('_', ' ').title()}" if tag in selected else tag.replace("_", " ").title(),
+            callback_data=key,
+        )]
+        for key, tag in PREFERENCE_OPTIONS.items()
+    ]
+    rows.append([InlineKeyboardButton("Done picking ➡️", callback_data="pref_done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _preferences_step_text(selected: list[str]) -> str:
+    text = "*Step 2/5:* Pick a couple that fit you:"
+    if selected:
+        labels = ", ".join(tag.replace("_", " ").title() for tag in selected)
+        text += f"\n\nSelected: {labels}"
+    return text
+
+
 async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["preferences"] = []
     keyboard = [
@@ -23,8 +46,11 @@ async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("₹800–1500", callback_data="budget_800_1500")],
     ]
     await update.message.reply_text(
-        "Hi, I'm your Choir representative. Quick setup, about 30 seconds.\n\nUsual budget for an outing?",
+        "*Hi, I'm your Choir representative.* Quick setup, about 30 seconds — this is what I'll "
+        "privately negotiate on your behalf with, no one else in the group sees your exact answers.\n\n"
+        "*Step 1/5:* Usual budget for an outing?",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN,
     )
     return BUDGET
 
@@ -35,12 +61,11 @@ async def handle_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, low, high = query.data.split("_")
     context.user_data["budget_min"], context.user_data["budget_max"] = int(low), int(high)
 
-    keyboard = [
-        [InlineKeyboardButton(label.replace("_", " ").title(), callback_data=key)]
-        for key, label in PREFERENCE_OPTIONS.items()
-    ]
-    keyboard.append([InlineKeyboardButton("Done picking", callback_data="pref_done")])
-    await query.edit_message_text("Pick a couple that fit you:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(
+        _preferences_step_text(context.user_data["preferences"]),
+        reply_markup=_preferences_keyboard(context.user_data["preferences"]),
+        parse_mode=ParseMode.MARKDOWN,
+    )
     return PREFERENCES
 
 
@@ -49,20 +74,46 @@ async def handle_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     if query.data == "pref_done":
-        await query.edit_message_text("Last thing — where are you usually around? (e.g. HSR Layout)")
+        await query.edit_message_text(
+            "*Step 3/5:* Where are you usually around? (e.g. HSR Layout)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return AREA
 
     tag = PREFERENCE_OPTIONS.get(query.data)
-    if tag and tag not in context.user_data["preferences"]:
-        context.user_data["preferences"].append(tag)
+    if tag:
+        # Toggle — tapping a selected preference again deselects it, so a
+        # mis-tap is correctable without restarting the whole flow.
+        if tag in context.user_data["preferences"]:
+            context.user_data["preferences"].remove(tag)
+        else:
+            context.user_data["preferences"].append(tag)
+
+    await query.edit_message_text(
+        _preferences_step_text(context.user_data["preferences"]),
+        reply_markup=_preferences_keyboard(context.user_data["preferences"]),
+        parse_mode=ParseMode.MARKDOWN,
+    )
     return PREFERENCES
 
 
 async def handle_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["area"] = update.message.text.strip()
     await update.message.reply_text(
-        "Last thing — anything specific about you we should know? "
-        "(dietary needs, a scheduling quirk, whatever's useful — or send \"skip\")"
+        "*Step 4/5:* Any dietary restrictions or allergies we should know? "
+        "(e.g. vegan, nut allergy — or send \"none\")",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return DIETARY
+
+
+async def handle_dietary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["dietary_notes"] = None if text.lower() == "none" else text
+    await update.message.reply_text(
+        "*Step 5/5:* Anything else specific about you we should know? "
+        "(a scheduling quirk, anything else useful — or send \"skip\")",
+        parse_mode=ParseMode.MARKDOWN,
     )
     return ANYTHING_ELSE
 
@@ -77,6 +128,7 @@ async def handle_anything_else(update: Update, context: ContextTypes.DEFAULT_TYP
         budget_max=context.user_data["budget_max"],
         preferences=context.user_data.get("preferences", []),
         area=context.user_data["area"],
+        dietary_notes=context.user_data.get("dietary_notes"),
         notes=notes,
     )
     save_profile(profile)
@@ -86,8 +138,9 @@ async def handle_anything_else(update: Update, context: ContextTypes.DEFAULT_TYP
     # group message after this.
     record_seen_member(update.effective_chat.id, update.effective_user.id, update.effective_user.first_name)
     await update.message.reply_text(
-        f"All set. Budget ₹{profile.budget_min}-₹{profile.budget_max}, "
-        f"around {profile.area}. I'll negotiate on your behalf from now on."
+        f"*All set ✅* Budget ₹{profile.budget_min}-₹{profile.budget_max}, "
+        f"around {profile.area}. I'll negotiate on your behalf from now on — privately, using what you told me here.",
+        parse_mode=ParseMode.MARKDOWN,
     )
     context.user_data.clear()
     return ConversationHandler.END

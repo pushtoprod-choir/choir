@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from urllib.parse import quote
 
 from telegram import Update
 from telegram.constants import ChatType, ParseMode
@@ -11,12 +12,61 @@ from choir.schemas import NegotiationRequest, AgentSignal
 from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.venues.places import build_venue_query, find_venues
 from choir.venues.enrichment import enrich_venues
+from choir.bot.intent import is_planning_request
 
 # Chats with a negotiation currently in flight — guards against a second
 # /choir stomping on a running one (e.g. someone double-tapping the command).
 # Single-threaded event loop, so plain set membership checks are race-free
 # as long as we don't await between the check and the add.
 _active_negotiations: set[int] = set()
+
+# Telegram's hard cap is 4096 chars; leave headroom below it since Markdown
+# entities and the surrounding reply text add to the same budget — this
+# margin also covers the "(+N more, trimmed for length)" suffix _build_
+# venues_text appends after its own budget check, which isn't itself
+# accounted for in that check.
+TELEGRAM_MESSAGE_LIMIT = 4096
+VENUES_SAFETY_MARGIN = 200
+
+
+def _build_venues_text(venues: list, max_chars: int) -> str:
+    """Renders the venue block, dropping trailing venues (cheapest ones to
+    lose — they're already the least-relevant nearby-search results) until
+    it fits max_chars, so a longer venue list can never push the combined
+    message over Telegram's cap the way the transcript once did."""
+    if not venues or max_chars <= 0:
+        return ""
+
+    venue_lines = []
+    for v in venues:
+        line = f"📍 *{v.name}*\n   {v.address}"
+        if v.note:
+            line += f"\n   💬 {v.note}"
+        # place search resolves to the actual venue; a bare lat/lon query
+        # drops you at a generic map pin instead. Query on the full
+        # address (which LocationIQ already prefixes with the venue
+        # name) rather than just the name, so generic names like "Snack
+        # Corner" don't resolve to some other branch across town.
+        line += f"\n   🔗 https://www.google.com/maps/place?q={quote(v.address)}"
+        venue_lines.append(line)
+
+    header = "\n\n*🍽️ Real options nearby:*\n\n"
+    included: list[str] = []
+    running_len = len(header)
+    for line in venue_lines:
+        addition = ("\n\n" if included else "") + line
+        if running_len + len(addition) > max_chars:
+            break
+        included.append(line)
+        running_len += len(addition)
+
+    if not included:
+        return ""
+    text = header + "\n\n".join(included)
+    omitted = len(venues) - len(included)
+    if omitted:
+        text += f"\n\n_(+{omitted} more nearby, trimmed for length)_"
+    return text
 
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -40,6 +90,15 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not goal_text:
         await message.reply_text(
             "Tell me what you want to plan — e.g. /choir plan lunch for us", parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Cheap gate so "/choir what's up" doesn't spin up a full negotiation —
+    # only actually negotiate when this reads like a genuine planning ask.
+    if not await asyncio.to_thread(is_planning_request, goal_text):
+        await message.reply_text(
+            "I'm here to help plan outings — try something like `/choir plan lunch for us` 🙂",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -87,15 +146,15 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
-        lines = [f"*Round {round_num + 1}:*"]
+        lines = [f"🔁 *Round {round_num + 1}*"]
         for s in signals:
             name = get_member_name(message.chat_id, s.user_id)
             if s.stance == "ACCEPT":
-                lines.append(f"  *{name}*: accepted")
+                lines.append(f"✅ *{name}*: accepted")
             elif s.stance == "COUNTER":
-                lines.append(f"  *{name}*: countered — {s.reason}")
+                lines.append(f"🔄 *{name}*: countered — {s.reason}")
             else:
-                lines.append(f"  *{name}*: rejected — {s.reason}")
+                lines.append(f"❌ *{name}*: rejected — {s.reason}")
         await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     # run_negotiation is synchronous; on_round is a coroutine, so drive it from a sync callback
@@ -123,29 +182,26 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     venues = await asyncio.to_thread(find_venues, venue_query, os.environ["LOCATION_IQ_API_KEY"])
     if venues:
         venues = await asyncio.to_thread(enrich_venues, venues, venue_query.purpose)
-    venues_text = ""
-    if venues:
-        venue_lines = []
-        for v in venues:
-            line = f"- *{v.name}* ({v.address})"
-            if v.note:
-                line += f" — {v.note}"
-            if v.lat and v.lon:
-                line += f"\n  📍 https://www.google.com/maps?q={v.lat},{v.lon}"
-            venue_lines.append(line)
-        venues_text = "\n\n*Real options nearby:*\n" + "\n".join(venue_lines)
 
     if result.converged:
-        reply = f"{result.decision}\n\n{result.explanation}"
+        reply = f"🎉 *Decision:* {result.decision}\n\n{result.explanation}"
         if result.tradeoffs:
-            reply += "\n\n*Why:*\n" + "\n".join(f"- {t}" for t in result.tradeoffs)
-        await message.reply_text(reply + venues_text, parse_mode=ParseMode.MARKDOWN)
+            reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
+        budget = TELEGRAM_MESSAGE_LIMIT - VENUES_SAFETY_MARGIN - len(reply)
+        try:
+            await message.reply_text(reply + _build_venues_text(venues, budget), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            logging.exception("Failed to send decision message; retrying without venues")
+            await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
     else:
-        options_text = "\n".join(f"- {opt}" for opt in result.top_options)
-        await message.reply_text(
-            f"Couldn't fully agree — here are the top options:\n{options_text}{venues_text}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        options_text = "\n".join(f"• {opt}" for opt in result.top_options)
+        base = f"🤔 *Couldn't fully agree — here are the top options:*\n{options_text}"
+        budget = TELEGRAM_MESSAGE_LIMIT - VENUES_SAFETY_MARGIN - len(base)
+        try:
+            await message.reply_text(base + _build_venues_text(venues, budget), parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            logging.exception("Failed to send top-options message; retrying without venues")
+            await message.reply_text(base, parse_mode=ParseMode.MARKDOWN)
 
     # The proof this was a real negotiation, not a single hidden API call —
     # sent as a follow-up so the main decision stays the headline message.
@@ -155,6 +211,6 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if len(transcript) > 3500:
             transcript = format_transcript(result.rounds[-2:], resolve_name) + "\n\n(earlier rounds omitted for length)"
         try:
-            await message.reply_text("See how we got here:\n\n" + transcript, parse_mode=ParseMode.MARKDOWN)
+            await message.reply_text(f"*📜 See how we got here:*\n\n{transcript}", parse_mode=ParseMode.MARKDOWN)
         except Exception:
             logging.exception("Failed to send negotiation transcript")

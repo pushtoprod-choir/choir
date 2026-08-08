@@ -7,6 +7,7 @@ error, bad response shape) falls back to the original unenriched venue list.
 """
 import json
 import logging
+import re
 
 from anthropic import Anthropic
 
@@ -21,6 +22,17 @@ MODEL = "claude-haiku-4-5"
 # MODEL = "claude-sonnet-5"
 
 ENRICH_TIMEOUT_SECONDS = 8
+
+# web_search grounding sometimes wraps cited claims in <cite>...</cite> even
+# though we never enabled the citations feature — strip it so raw markup
+# doesn't leak into the note shown in the group chat.
+_CITE_PAIR_RE = re.compile(r"<cite[^>]*>(.*?)</cite>", re.DOTALL)
+_CITE_STRAY_RE = re.compile(r"</?cite[^>]*>")
+
+
+def _strip_citations(text: str) -> str:
+    text = _CITE_PAIR_RE.sub(r"\1", text)
+    return _CITE_STRAY_RE.sub("", text).strip()
 
 
 def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
@@ -54,18 +66,21 @@ def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
         if not isinstance(notes, list) or len(notes) != len(venues):
             raise ValueError(f"expected {len(venues)} notes, got {notes!r}")
 
-        return [
-            VenueResult(
+        result = []
+        for v, note in zip(venues, notes):
+            note_text = note.get("note") if isinstance(note, dict) else None
+            if note_text:
+                note_text = _strip_citations(note_text) or None
+            result.append(VenueResult(
                 name=v.name,
                 address=v.address,
                 rating=v.rating,
                 price_level=v.price_level,
                 lat=v.lat,
                 lon=v.lon,
-                note=(note.get("note") or None) if isinstance(note, dict) else None,
-            )
-            for v, note in zip(venues, notes)
-        ]
+                note=note_text,
+            ))
+        return result
     except Exception:
         logger.exception("Venue enrichment failed; falling back to unenriched venues")
         return venues
