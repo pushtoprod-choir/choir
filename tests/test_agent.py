@@ -18,6 +18,7 @@ from choir.engine.agent import _build_response_schema, get_agent_response
 from choir.schemas import AgentSignal, UserProfile, VenueResult
 
 PROFILE = UserProfile(telegram_user_id=1, budget_min=100, budget_max=500, preferences=["foodie"], area="HSR")
+PLAN_DATE = "2026-08-15"
 
 
 def text_response(payload: dict, stop_reason: str = "end_turn"):
@@ -31,18 +32,32 @@ class TestGetAgentResponse(unittest.TestCase):
     @patch("choir.engine.agent.client.messages.create")
     def test_happy_path_builds_the_expected_signal(self, mock_create):
         mock_create.return_value = text_response(
-            {"stance": "COUNTER", "reason": "too far", "counter_proposal": "Cafe X"}
+            {"stance": "COUNTER", "reason": "too far", "counter_proposal": "Cafe X", "proposed_time": "19:00"}
         )
-        signal = get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
 
         self.assertEqual(signal.user_id, 1)
         self.assertEqual(signal.stance, "COUNTER")
         self.assertEqual(signal.counter_proposal, "Cafe X")
+        self.assertEqual(signal.proposed_time, "19:00")
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_malformed_proposed_time_falls_back_to_reject(self, mock_create):
+        # Schema constrains the type to a string but not its format — "7:30pm"
+        # instead of "19:30" must be caught here, not flow downstream and
+        # break the deterministic date+time combination in scheduling.py.
+        mock_create.return_value = text_response(
+            {"stance": "ACCEPT", "reason": "fine", "counter_proposal": None, "proposed_time": "7:30pm"}
+        )
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, "Cafe X", "19:30", 0, 4)
+
+        self.assertEqual(signal.stance, "REJECT")
+        self.assertIn("parse", signal.reason)
 
     @patch("choir.engine.agent.client.messages.create")
     def test_api_error_falls_back_to_reject_instead_of_raising(self, mock_create):
         mock_create.side_effect = anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com"))
-        signal = get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
 
         self.assertEqual(signal.stance, "REJECT")
         self.assertIn("reach", signal.reason)
@@ -53,7 +68,7 @@ class TestGetAgentResponse(unittest.TestCase):
         # classifier refusal looks like. Before this fix, this raised an
         # uncaught StopIteration.
         mock_create.return_value = SimpleNamespace(content=[], stop_reason="refusal")
-        signal = get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
 
         self.assertEqual(signal.stance, "REJECT")
 
@@ -62,7 +77,7 @@ class TestGetAgentResponse(unittest.TestCase):
         # Belt-and-suspenders: no text block at all, for any reason, must not
         # raise StopIteration regardless of stop_reason.
         mock_create.return_value = SimpleNamespace(content=[], stop_reason="end_turn")
-        signal = get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
 
         self.assertEqual(signal.stance, "REJECT")
 
@@ -73,7 +88,7 @@ class TestGetAgentResponse(unittest.TestCase):
             content=[SimpleNamespace(type="text", text='{"stance": "ACCEPT", "reason": "fi')],
             stop_reason="max_tokens",
         )
-        signal = get_agent_response(PROFILE, "plan lunch", "Cafe X", 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, "Cafe X", "19:00", 0, 4)
 
         self.assertEqual(signal.stance, "REJECT")
         self.assertIn("parse", signal.reason)
@@ -83,7 +98,7 @@ class TestGetAgentResponse(unittest.TestCase):
         # Valid JSON, but missing a key the schema should have required —
         # defense in depth against a future API/schema mismatch.
         mock_create.return_value = text_response({"stance": "ACCEPT"})
-        signal = get_agent_response(PROFILE, "plan lunch", "Cafe X", 0, 4)
+        signal = get_agent_response(PROFILE, "plan lunch", PLAN_DATE, "Cafe X", "19:00", 0, 4)
 
         self.assertEqual(signal.stance, "REJECT")
         self.assertIn("parse", signal.reason)
@@ -95,13 +110,13 @@ class TestGetAgentResponse(unittest.TestCase):
         # counter_proposal to those exact names — the model is structurally
         # unable to invent a venue, not just asked nicely not to.
         mock_create.return_value = text_response(
-            {"stance": "COUNTER", "reason": "closer", "counter_proposal": "Cafe A"}
+            {"stance": "COUNTER", "reason": "closer", "counter_proposal": "Cafe A", "proposed_time": "19:00"}
         )
         candidates = [
             VenueResult(name="Cafe A", address="HSR", rating=0, price_level=0),
             VenueResult(name="Cafe B", address="Indiranagar", rating=0, price_level=0),
         ]
-        get_agent_response(PROFILE, "plan lunch", None, 0, 4, candidates)
+        get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4, candidates)
 
         sent_schema = mock_create.call_args.kwargs["output_config"]["format"]["schema"]
         self.assertEqual(set(sent_schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None})
@@ -109,27 +124,49 @@ class TestGetAgentResponse(unittest.TestCase):
     @patch("choir.engine.agent.client.messages.create")
     def test_other_signals_are_summarized_into_the_prompt(self, mock_create):
         mock_create.return_value = text_response(
-            {"stance": "COUNTER", "reason": "compromise", "counter_proposal": "Cafe Mid"}
+            {"stance": "COUNTER", "reason": "compromise", "counter_proposal": "Cafe Mid", "proposed_time": "19:00"}
         )
         other_signals = [
-            AgentSignal(user_id=2, stance="COUNTER", reason="too far east", counter_proposal="Whitefield"),
+            AgentSignal(user_id=2, stance="COUNTER", reason="too far east", counter_proposal="Whitefield", proposed_time="20:00"),
         ]
-        get_agent_response(PROFILE, "plan lunch", "Cafe A", 1, 4, other_signals=other_signals)
+        get_agent_response(PROFILE, "plan lunch", PLAN_DATE, "Cafe A", "19:00", 1, 4, other_signals=other_signals)
 
         system_prompt = mock_create.call_args.kwargs["system"]
         self.assertIn("What everyone else in the group said last round:", system_prompt)
         self.assertIn("too far east", system_prompt)
         self.assertIn("Whitefield", system_prompt)
+        self.assertIn("wants time: 20:00", system_prompt)
 
     @patch("choir.engine.agent.client.messages.create")
     def test_no_other_signals_omits_the_summary_block(self, mock_create):
         mock_create.return_value = text_response(
-            {"stance": "COUNTER", "reason": "fine", "counter_proposal": "Cafe A"}
+            {"stance": "COUNTER", "reason": "fine", "counter_proposal": "Cafe A", "proposed_time": "19:00"}
         )
-        get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+        get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
 
         system_prompt = mock_create.call_args.kwargs["system"]
         self.assertNotIn("What everyone else in the group said last round:", system_prompt)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_plan_date_and_current_time_appear_in_the_prompt(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "ACCEPT", "reason": "fine", "counter_proposal": None, "proposed_time": "19:00"}
+        )
+        get_agent_response(PROFILE, "plan lunch", PLAN_DATE, "Cafe A", "19:00", 0, 4)
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        self.assertIn(PLAN_DATE, system_prompt)
+        self.assertIn("Current proposed time on the table: 19:00", system_prompt)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_no_current_time_prompts_the_agent_to_propose_one(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "COUNTER", "reason": "fine", "counter_proposal": "Cafe A", "proposed_time": "19:00"}
+        )
+        get_agent_response(PROFILE, "plan lunch", PLAN_DATE, None, None, 0, 4)
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        self.assertIn("No time has been proposed yet", system_prompt)
 
 
 class TestBuildResponseSchema(unittest.TestCase):
@@ -140,6 +177,11 @@ class TestBuildResponseSchema(unittest.TestCase):
     def test_candidates_constrain_to_an_exact_enum(self):
         schema = _build_response_schema(["Cafe A", "Cafe B"])
         self.assertEqual(set(schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None})
+
+    def test_proposed_time_is_always_a_required_non_null_string(self):
+        schema = _build_response_schema(["Cafe A"])
+        self.assertIn("proposed_time", schema["required"])
+        self.assertEqual(schema["properties"]["proposed_time"], {"type": "string"})
 
 
 if __name__ == "__main__":

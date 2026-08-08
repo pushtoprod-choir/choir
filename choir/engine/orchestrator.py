@@ -62,6 +62,12 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
     max_rounds = _round_budget(len(request.profiles))
 
     current_proposal: str | None = None
+    # Mirrors current_proposal's "on the table" pattern, applied to the
+    # meeting time instead of the venue — plan_date is fixed up front (see
+    # NegotiationRequest.plan_date), so this is the only other thing that
+    # needs converging on. Unlike current_proposal, it's never None once
+    # round 0 completes: every agent response always carries a proposed_time.
+    current_time: str | None = None
     # Every round's signals, kept around so a non-convergent negotiation can
     # still surface the best options it saw instead of just giving up empty.
     history: list[list[AgentSignal]] = []
@@ -73,8 +79,8 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
     for round_num in range(max_rounds):
         round_started = time.monotonic()
         signals = _get_signals_for_round(
-            request.profiles, request.goal_text, current_proposal, round_num, max_rounds, candidates,
-            previous_signals,
+            request.profiles, request.goal_text, request.plan_date, current_proposal, current_time,
+            round_num, max_rounds, candidates, previous_signals,
         )
         history.append(signals)
         previous_signals = signals
@@ -91,12 +97,12 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
         # on the table yet, so an ACCEPT from everyone would mean "we all agree
         # on nothing" — a real failure mode if the model ever ignores the "no
         # proposal yet, suggest one" instruction in agent.py's prompt.
-        if current_proposal is not None and all(s.stance == "ACCEPT" for s in signals):
+        if current_proposal is not None and current_time is not None and all(s.stance == "ACCEPT" for s in signals):
             if _verify_decision(current_proposal, candidates, request.profiles, area_coords):
                 decided_venue = next((v for v in candidates if v.name == current_proposal), None)
                 logger.info(
-                    "Negotiation converged: chat=%s rounds=%d decision=%r total=%.2fs",
-                    request.group_chat_id, round_num + 1, current_proposal, time.monotonic() - started,
+                    "Negotiation converged: chat=%s rounds=%d decision=%r time=%s total=%.2fs",
+                    request.group_chat_id, round_num + 1, current_proposal, current_time, time.monotonic() - started,
                 )
                 return NegotiationResult(
                     converged=True,
@@ -105,6 +111,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
                     tradeoffs=_build_tradeoffs(signals),
                     rounds=history,
                     decided_venue=decided_venue,
+                    decided_time=current_time,
                 )
             # Everyone said ACCEPT, but the deterministic distance check
             # overrode it — don't report a false "unanimous," fall through
@@ -122,6 +129,7 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
             # Round 1 and nobody proposed or accepted anything — there's
             # nothing to iterate on, so stop instead of repeating empty rounds.
             break
+        current_time = _select_next_time(current_time, signals)
 
     # Did not converge within the round budget (or failed the hard-constraint check)
     # — an honest "here are the top options" result, not a fake forced
@@ -142,7 +150,9 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
 def _get_signals_for_round(
     profiles: list[UserProfile],
     goal_text: str,
+    plan_date: str,
     current_proposal: str | None,
+    current_time: str | None,
     round_num: int,
     max_rounds: int,
     candidates: list[VenueResult],
@@ -162,7 +172,8 @@ def _get_signals_for_round(
     with ThreadPoolExecutor(max_workers=max(len(profiles), 1)) as pool:
         futures = [
             pool.submit(
-                get_agent_response, profile, goal_text, current_proposal, round_num, max_rounds, candidates,
+                get_agent_response, profile, goal_text, plan_date, current_proposal, current_time,
+                round_num, max_rounds, candidates,
                 [s for s in previous_signals if s.user_id != profile.telegram_user_id] if previous_signals else None,
             )
             for profile in profiles
@@ -275,6 +286,30 @@ def _select_next_proposal(current_proposal: str | None, signals: list[AgentSigna
     return leaders[0] if len(leaders) == 1 else counters[0].counter_proposal
 
 
+def _select_next_time(current_time: str | None, signals: list[AgentSignal]) -> str | None:
+    """Same convergence-forming logic as _select_next_proposal, applied to
+    the meeting time instead of the venue: majority agreement on the time
+    already on the table keeps it tabled (so agreement survives instead of
+    bouncing to whoever spoke last), otherwise the plurality of what everyone
+    is currently proposing wins the next round's table time. Unlike
+    counter_proposal, proposed_time is required on every signal — there's
+    always at least one time to tally, so this only returns None if `signals`
+    itself is empty, which never happens with a non-empty profile list."""
+    times = [s.proposed_time for s in signals if s.proposed_time]
+    if not times:
+        return current_time
+
+    if current_time is not None:
+        agree_count = sum(1 for t in times if t == current_time)
+        if agree_count > len(signals) / 2:
+            return current_time
+
+    tally = Counter(times)
+    top_count = max(tally.values())
+    leaders = [t for t, count in tally.items() if count == top_count]
+    return leaders[0] if len(leaders) == 1 else times[0]
+
+
 def _build_explanation(signals: list[AgentSignal]) -> str:
     """One short line for the group message, e.g. the ACCEPT reasons combined."""
     reasons = [s.reason for s in signals if s.reason]
@@ -331,5 +366,7 @@ def format_transcript(rounds: list[list[AgentSignal]], resolve_name: Optional[Ca
             line = f"  {name}: {s.stance} — {s.reason}"
             if s.counter_proposal:
                 line += f" (proposes: {s.counter_proposal})"
+            if s.proposed_time:
+                line += f" (time: {s.proposed_time})"
             lines.append(line)
     return "\n".join(lines)

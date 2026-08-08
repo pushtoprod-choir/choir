@@ -1,8 +1,8 @@
 """Offline tests for the /choir command's message-flow orchestration — no
 Telegram, no API keys. Mocks the DB layer and run_negotiation itself (already
 live-verified separately in test_engine.py); this file is purely about the
-occasion-capture and /choir update glue logic in choir/bot/handlers.py, which
-had zero test coverage before this.
+command-dispatch (start trip / plan / end trip / rejecting anything else) and
+occasion-capture glue logic in choir/bot/handlers.py.
 """
 import itertools
 import unittest
@@ -38,11 +38,14 @@ def make_context(args: list[str]):
     return SimpleNamespace(args=args, bot=SimpleNamespace(username="choir_bot"))
 
 
-class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
+ACTIVE_TRIP = {"id": 1, "chat_id": None, "started_by": 1, "title": "Test Trip", "started_at": "now"}
+PLAN_DATE = "2026-08-15"
+
+
+class TestOccasionAndTripFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         handlers._active_negotiations.clear()
         handlers._pending_occasion.clear()
-        handlers._last_decision.clear()
         handlers._processed_update_ids.clear()
         handlers._processed_update_id_order.clear()
 
@@ -54,8 +57,11 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.start_negotiation_log", return_value=1),
             patch("choir.bot.handlers.record_negotiation_round"),
             patch("choir.bot.handlers.finish_negotiation_log"),
-            patch("choir.bot.handlers.get_negotiation_history", return_value=[]),
-            patch("choir.bot.handlers.get_active_trip", return_value=None),
+            # "plan" only works within an active trip — default a trip is
+            # already open so existing occasion/negotiation tests below don't
+            # each need to set one up; tests specifically about trip
+            # start/end override this per-test.
+            patch("choir.bot.handlers.get_active_trip", return_value=ACTIVE_TRIP),
             patch("choir.bot.handlers.attach_calendar_availability"),
             patch("choir.bot.handlers.create_events_for_connected", return_value=None),
         ]
@@ -72,12 +78,20 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.mock_is_planning = is_planning_patch.start()
         self.addCleanup(is_planning_patch.stop)
 
+        # extract_plan_date also hits the Anthropic API for real — defaults
+        # to a valid date so existing occasion/negotiation tests don't each
+        # need to set one up; tests specifically about the date gate flip
+        # this to None.
+        extract_date_patch = patch("choir.bot.handlers.extract_plan_date", return_value=PLAN_DATE)
+        self.mock_extract_date = extract_date_patch.start()
+        self.addCleanup(extract_date_patch.stop)
 
         run_patch = patch("choir.bot.handlers.run_negotiation")
         self.mock_run = run_patch.start()
         self.addCleanup(run_patch.stop)
         self.mock_run.return_value = NegotiationResult(
             converged=True, decision="Test Cafe", explanation="works", tradeoffs=["fine"], rounds=[],
+            decided_time="19:00",
         )
 
     async def test_choir_asks_for_occasion_before_negotiating(self):
@@ -89,7 +103,7 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("occasion", message.reply_text.call_args[0][0].lower())
 
     async def test_occasion_reply_triggers_negotiation_with_context_included(self):
-        handlers._pending_occasion[100] = "plan lunch"
+        handlers._pending_occasion[100] = handlers._PendingPlan(goal_text="plan lunch", plan_date=PLAN_DATE)
         message = make_message(chat_id=100, text="my birthday!")
         await handlers.handle_occasion_reply(make_update(message), None)
 
@@ -98,9 +112,10 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("plan lunch", goal_text)
         self.assertIn("birthday", goal_text)
         self.assertNotIn(100, handlers._pending_occasion)
+        self.assertEqual(self.mock_run.call_args[0][0].plan_date, PLAN_DATE)
 
     async def test_skip_reply_omits_occasion_from_goal_text(self):
-        handlers._pending_occasion[100] = "plan lunch"
+        handlers._pending_occasion[100] = handlers._PendingPlan(goal_text="plan lunch", plan_date=PLAN_DATE)
         message = make_message(chat_id=100, text="skip")
         await handlers.handle_occasion_reply(make_update(message), None)
 
@@ -114,41 +129,37 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.mock_run.assert_not_called()
         message.reply_text.assert_not_called()
 
-    async def test_update_with_no_prior_decision_is_rejected(self):
+    async def test_update_command_is_rejected_as_unrecognized(self):
+        # "/choir update <reason>" was the old revision command — no longer
+        # one of the three recognized forms, so it must be rejected outright
+        # rather than silently treated as a "plan" goal.
         message = make_message(chat_id=200, text="/choir update running late")
         await handlers.handle_choir_command(make_update(message), make_context(["update", "running", "late"]))
 
         self.mock_run.assert_not_called()
-        self.assertIn("no previous plan", message.reply_text.call_args[0][0].lower())
+        self.assertIn("i only understand", message.reply_text.call_args[0][0].lower())
 
-    async def test_update_with_no_reason_is_rejected(self):
-        handlers._last_decision[200] = "Cafe Old"
-        message = make_message(chat_id=200, text="/choir update")
-        await handlers.handle_choir_command(make_update(message), make_context(["update"]))
+    async def test_unrecognized_command_is_rejected(self):
+        message = make_message(chat_id=200, text="/choir what's up")
+        await handlers.handle_choir_command(make_update(message), make_context(["what's", "up"]))
 
         self.mock_run.assert_not_called()
-        self.assertIn("tell me why", message.reply_text.call_args[0][0].lower())
+        self.assertIn("i only understand", message.reply_text.call_args[0][0].lower())
 
-    async def test_update_with_a_prior_decision_seeds_goal_text_and_skips_occasion(self):
-        handlers._last_decision[200] = "Cafe Old"
-        message = make_message(chat_id=200, text="/choir update someone's running late")
-        await handlers.handle_choir_command(
-            make_update(message), make_context(["update", "someone's", "running", "late"])
-        )
+    async def test_plan_without_an_active_trip_is_rejected(self):
+        with patch("choir.bot.handlers.get_active_trip", return_value=None):
+            message = make_message(chat_id=100, text="/choir plan lunch")
+            await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
 
-        self.mock_run.assert_called_once()
-        self.assertNotIn(200, handlers._pending_occasion)
-        goal_text = self.mock_run.call_args[0][0].goal_text
-        self.assertIn("Cafe Old", goal_text)
-        self.assertIn("running late", goal_text)
+        self.mock_run.assert_not_called()
+        self.assertIn("start a trip first", message.reply_text.call_args[0][0].lower())
 
-    async def test_converged_negotiation_is_remembered_for_a_future_update(self):
-        message = make_message(chat_id=100, text="/choir plan lunch")
-        await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
-        reply_message = make_message(chat_id=100, text="skip")
-        await handlers.handle_occasion_reply(make_update(reply_message), None)
+    async def test_plan_with_no_description_is_rejected(self):
+        message = make_message(chat_id=100, text="/choir plan")
+        await handlers.handle_choir_command(make_update(message), make_context(["plan"]))
 
-        self.assertEqual(handlers._last_decision[100], "Test Cafe")
+        self.mock_run.assert_not_called()
+        self.assertIn("tell me what you want to plan", message.reply_text.call_args[0][0].lower())
 
     async def test_concurrency_guard_blocks_a_second_choir(self):
         handlers._active_negotiations.add(300)
@@ -159,7 +170,7 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already negotiating", message.reply_text.call_args[0][0].lower())
 
     async def test_second_choir_while_occasion_pending_is_rejected(self):
-        handlers._pending_occasion[100] = "plan lunch"
+        handlers._pending_occasion[100] = handlers._PendingPlan(goal_text="plan lunch", plan_date=PLAN_DATE)
         message = make_message(chat_id=100, text="/choir plan something else")
         await handlers.handle_choir_command(make_update(message), make_context(["plan", "something", "else"]))
 
@@ -168,29 +179,29 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_planning_message_is_gated_before_the_occasion_question(self):
         self.mock_is_planning.return_value = False
-        message = make_message(chat_id=100, text="/choir what's up")
-        await handlers.handle_choir_command(make_update(message), make_context(["what's", "up"]))
+        message = make_message(chat_id=100, text="/choir plan what's up")
+        await handlers.handle_choir_command(make_update(message), make_context(["plan", "what's", "up"]))
 
         self.mock_run.assert_not_called()
         self.assertNotIn(100, handlers._pending_occasion)
         self.assertIn("plan", message.reply_text.call_args[0][0].lower())
+        # Fails the cheap intent gate before ever spending a call on date
+        # extraction — no point asking for a date on something that isn't a
+        # real planning request in the first place.
+        self.mock_extract_date.assert_not_called()
 
-    async def test_update_bypasses_intent_gating_even_with_a_non_planning_sounding_reason(self):
-        # A revision reason like "someone's running late" would plausibly
-        # fail a naive planning-intent classifier despite being a completely
-        # valid /choir update — the update path must never call it at all.
-        self.mock_is_planning.return_value = False
-        handlers._last_decision[200] = "Cafe Old"
-        message = make_message(chat_id=200, text="/choir update someone's running late")
-        await handlers.handle_choir_command(
-            make_update(message), make_context(["update", "someone's", "running", "late"])
-        )
+    async def test_plan_with_no_date_is_rejected(self):
+        self.mock_extract_date.return_value = None
+        message = make_message(chat_id=100, text="/choir plan lunch")
+        await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
 
-        self.mock_is_planning.assert_not_called()
-        self.mock_run.assert_called_once()
+        self.mock_run.assert_not_called()
+        self.assertNotIn(100, handlers._pending_occasion)
+        self.assertIn("what date", message.reply_text.call_args[0][0].lower())
 
     async def test_start_trip_creates_a_trip_and_blocks_a_second_start(self):
-        with patch("choir.bot.handlers.start_trip", return_value=5) as mock_start_trip:
+        with patch("choir.bot.handlers.get_active_trip", return_value=None), \
+             patch("choir.bot.handlers.start_trip", return_value=5) as mock_start_trip:
             message = make_message(chat_id=100, text="/choir start trip Goa")
             await handlers.handle_choir_command(make_update(message), make_context(["start", "trip", "Goa"]))
 
@@ -208,15 +219,16 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already in progress", message.reply_text.call_args[0][0].lower())
 
     async def test_end_trip_with_none_active_is_rejected(self):
-        message = make_message(chat_id=100, text="/choir end trip")
-        await handlers.handle_choir_command(make_update(message), make_context(["end", "trip"]))
+        with patch("choir.bot.handlers.get_active_trip", return_value=None):
+            message = make_message(chat_id=100, text="/choir end trip")
+            await handlers.handle_choir_command(make_update(message), make_context(["end", "trip"]))
 
         self.assertIn("no trip in progress", message.reply_text.call_args[0][0].lower())
 
     async def test_end_trip_summarizes_converged_decisions_and_closes_it_out(self):
         trip_negotiations = [
-            {"goal_text": "plan lunch", "converged": True, "decision": "Cafe X"},
-            {"goal_text": "plan dinner", "converged": False, "decision": None},
+            {"goal_text": "plan lunch", "converged": True, "decision": "Cafe X", "plan_date": PLAN_DATE, "decided_time": "19:00"},
+            {"goal_text": "plan dinner", "converged": False, "decision": None, "plan_date": None, "decided_time": None},
         ]
         with patch("choir.bot.handlers.get_active_trip", return_value={"id": 5, "title": "Goa"}), \
              patch("choir.bot.handlers.get_trip_negotiations", return_value=trip_negotiations), \
@@ -227,6 +239,7 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         mock_end_trip.assert_called_once()
         self.assertEqual(mock_end_trip.call_args[0][0], 5)
         self.assertIn("Cafe X", mock_end_trip.call_args[0][1])
+        self.assertIn("19:00", mock_end_trip.call_args[0][1])
         reply = message.reply_text.call_args[0][0]
         self.assertIn("trip", reply.lower())
         self.assertIn("Cafe X", reply)
@@ -235,9 +248,9 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         with patch("choir.bot.handlers.get_active_trip", return_value={"id": 7, "title": "Goa"}), \
              patch("choir.bot.handlers.start_negotiation_log", return_value=1) as mock_start_log:
             message = make_message(chat_id=100, text="/choir plan lunch")
-            await handlers._run_negotiation(message, "plan lunch")
+            await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
 
-        mock_start_log.assert_called_once_with(100, "plan lunch", trip_id=7)
+        mock_start_log.assert_called_once_with(100, "plan lunch", trip_id=7, plan_date=PLAN_DATE)
 
     async def test_redelivered_update_is_processed_only_once(self):
         # Telegram long-polling can redeliver the same update (a documented
@@ -286,7 +299,6 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         handlers._active_negotiations.clear()
         handlers._pending_occasion.clear()
-        handlers._last_decision.clear()
         handlers._processed_update_ids.clear()
         handlers._processed_update_id_order.clear()
 
@@ -309,13 +321,14 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
         venue = VenueResult(name="Cafe A", address="HSR", rating=0, price_level=0, lat=12.9, lon=77.6)
         run_patch = patch("choir.bot.handlers.run_negotiation", return_value=NegotiationResult(
             converged=True, decision="Cafe A", explanation="works", tradeoffs=[], rounds=[], decided_venue=venue,
+            decided_time="19:00",
         ))
         describe_patch = patch("choir.bot.handlers._describe_decided_venue", new_callable=AsyncMock, return_value="\n\ndescribed")
         fallback_patch = patch("choir.bot.handlers._fallback_venue_suggestions", new_callable=AsyncMock)
         calendar_patch = patch("choir.bot.handlers.create_events_for_connected", return_value=None)
         with run_patch, describe_patch as mock_describe, fallback_patch as mock_fallback, calendar_patch:
             message = make_message(chat_id=1, text="/choir plan lunch")
-            await handlers._run_negotiation(message, "plan lunch")
+            await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
 
         mock_describe.assert_awaited_once()
         mock_fallback.assert_not_called()
@@ -324,6 +337,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
     async def test_an_ungrounded_decision_falls_back_to_a_length_budgeted_search(self):
         run_patch = patch("choir.bot.handlers.run_negotiation", return_value=NegotiationResult(
             converged=True, decision="Some free-text plan", explanation="works", tradeoffs=[], rounds=[],
+            decided_time="19:00",
         ))
         describe_patch = patch("choir.bot.handlers._describe_decided_venue", new_callable=AsyncMock)
         fallback_patch = patch(
@@ -332,7 +346,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
         calendar_patch = patch("choir.bot.handlers.create_events_for_connected", return_value=None)
         with run_patch, describe_patch as mock_describe, fallback_patch as mock_fallback, calendar_patch:
             message = make_message(chat_id=1, text="/choir plan lunch")
-            await handlers._run_negotiation(message, "plan lunch")
+            await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
 
         mock_describe.assert_not_called()
         mock_fallback.assert_awaited_once()
@@ -346,21 +360,28 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
 
         run_patch = patch("choir.bot.handlers.run_negotiation", return_value=NegotiationResult(
             converged=True, decision="Cafe Old", explanation="works", tradeoffs=[], rounds=[],
+            decided_time="19:00",
         ))
         fallback_patch = patch("choir.bot.handlers._fallback_venue_suggestions", new_callable=AsyncMock, return_value="")
         calendar_patch = patch(
             "choir.bot.handlers.create_events_for_connected",
-            return_value=CalendarCreationSummary(connected=2, created=1, extraction_failed=False),
+            return_value=CalendarCreationSummary(connected=2, created=1, build_failed=False),
         )
-        with run_patch, fallback_patch, calendar_patch:
+        with run_patch, fallback_patch, calendar_patch as mock_calendar:
             message = make_message(chat_id=1, text="/choir plan lunch")
-            await handlers._run_negotiation(message, "plan lunch")
+            await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
 
         self.assertIn("1/2 connected calendars", message.reply_text.call_args[0][0])
+        # The event must be created at exactly what the agents decided —
+        # plan_date + decided_time — not re-derived from free text.
+        mock_calendar.assert_called_once_with(
+            [FAKE_PROFILE], "Cafe Old", PLAN_DATE, "19:00", None,
+        )
 
     async def test_reply_send_failure_retries_without_venues_instead_of_crashing(self):
         run_patch = patch("choir.bot.handlers.run_negotiation", return_value=NegotiationResult(
             converged=True, decision="Cafe Old", explanation="works", tradeoffs=[], rounds=[],
+            decided_time="19:00",
         ))
         fallback_patch = patch(
             "choir.bot.handlers._fallback_venue_suggestions", new_callable=AsyncMock, return_value="\n\nsome venues"
@@ -371,7 +392,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
             # First send (decision + venues) fails as if it were over Telegram's
             # limit; the retry without venues must still go out, not raise.
             message.reply_text = AsyncMock(side_effect=[Exception("message too long"), None])
-            await handlers._run_negotiation(message, "plan lunch")
+            await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
 
         self.assertEqual(message.reply_text.call_count, 2)
         second_call_text = message.reply_text.call_args_list[1][0][0]
