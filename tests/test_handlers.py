@@ -24,6 +24,7 @@ def make_message(chat_id: int, text: str = "", user_id: int = 1, is_bot: bool = 
         from_user=SimpleNamespace(id=user_id, first_name="Test", is_bot=is_bot),
         text=text,
         reply_text=AsyncMock(),
+        get_bot=lambda: SimpleNamespace(send_message=AsyncMock()),
     )
 
 
@@ -273,6 +274,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.finish_negotiation_log"),
             patch("choir.bot.handlers.attach_calendar_availability"),
             patch("choir.bot.handlers.get_missing_info_question", return_value=None),
+            patch("choir.bot.handlers._send_ride_suggestions"),
         ]
         for p in self.patches:
             p.start()

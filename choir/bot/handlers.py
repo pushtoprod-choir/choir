@@ -23,8 +23,9 @@ from choir.store.profiles import (
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
 from choir.engine.agent import get_missing_info_question
 from choir.engine.orchestrator import format_transcript, run_negotiation
-from choir.venues.places import build_venue_query, find_venues
+from choir.venues.places import build_venue_query, find_venues, geocode_areas, haversine_distance_km
 from choir.venues.enrichment import enrich_venues
+from choir.actions.links import build_ride_deeplink, describe_ride_suggestion, find_carpool_pairs
 from choir.bot.intent import is_planning_request
 from choir.calendar.client import attach_calendar_availability
 from choir.calendar.scheduling import create_events_for_connected
@@ -173,6 +174,49 @@ async def _fallback_venue_suggestions(
         return ""
     venues = await asyncio.to_thread(enrich_venues, venues, venue_query.purpose)
     return _build_venues_text(venues, max_chars)
+
+
+async def _send_ride_suggestions(chat_id: int, profiles: list[UserProfile], venue: VenueResult, bot) -> None:
+    """Best-effort, DM-only ride-suggestion stub — not a real booking, just a
+    pre-filled Uber deep link plus a distance-based carpool nudge, sent
+    privately (pickup area is personal, same reasoning as budget). Skips
+    entirely if LocationIQ isn't configured or the venue has no real
+    coordinates; a failed DM to one person never blocks another's."""
+    location_iq_key = os.environ.get("LOCATION_IQ_API_KEY")
+    if not location_iq_key or not (venue.lat and venue.lon):
+        return
+
+    areas = list({p.area for p in profiles})
+    area_coords = await asyncio.to_thread(geocode_areas, areas, location_iq_key)
+    dropoff = (venue.lat, venue.lon)
+
+    user_coords: dict[int, tuple[float, float]] = {}
+    for profile in profiles:
+        pickup = area_coords.get(profile.area)
+        if pickup is None:
+            continue
+        user_coords[profile.telegram_user_id] = pickup
+
+        distance = haversine_distance_km(pickup, dropoff)
+        text = describe_ride_suggestion(distance, build_ride_deeplink(pickup, dropoff))
+        if not text:
+            continue
+        try:
+            await bot.send_message(chat_id=profile.telegram_user_id, text=text)
+        except Exception:
+            logging.exception("Failed to DM ride suggestion to user %s", profile.telegram_user_id)
+
+    for user_a, user_b, _distance in find_carpool_pairs(user_coords):
+        name_a = get_member_name(chat_id, user_a)
+        name_b = get_member_name(chat_id, user_b)
+        for this_user, other_name in ((user_a, name_b), (user_b, name_a)):
+            try:
+                await bot.send_message(
+                    chat_id=this_user,
+                    text=f"🚗 You and {other_name} are both nearby — might be worth sharing a ride tonight.",
+                )
+            except Exception:
+                logging.exception("Failed to DM carpool suggestion to user %s", this_user)
 
 
 def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
@@ -564,6 +608,11 @@ async def _run_negotiation(
                 "Failed to send decision message; retrying without venues"
             )
             await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+        if result.decided_venue:
+            # Trailing, best-effort step — runs after the main decision
+            # message so a failure here can never affect or delay it.
+            await _send_ride_suggestions(message.chat_id, profiles, result.decided_venue, message.get_bot())
     else:
         options_text = "\n".join(f"• {opt}" for opt in result.top_options)
         base = f"🤔 *Couldn't fully agree — here are the top options:*\n{options_text}"
