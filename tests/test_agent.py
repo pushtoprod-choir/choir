@@ -132,6 +132,69 @@ class TestGetAgentResponse(unittest.TestCase):
         self.assertNotIn("What everyone else in the group said last round:", system_prompt)
 
 
+class TestAllContextSourcesCombined(unittest.TestCase):
+    """Every other test in this file exercises one context source at a time
+    (candidates alone, other_signals alone, etc.). This is the "everything is
+    on" shape a real negotiation actually has: occasion text folded into
+    goal_text, a dynamic-question answer sitting in temporary_context, a
+    calendar conflict, last round's signals from everyone else, and real
+    venue candidates, all at once. Each context source is just an independent
+    f-string block concatenated into one prompt, so this is mainly a
+    regression guard against one block accidentally clobbering another
+    (e.g. a stray brace) rather than a test of any new logic."""
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_every_context_source_reaches_the_prompt_without_clobbering_the_others(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "COUNTER", "reason": "considering everything", "counter_proposal": "Cafe A"}
+        )
+        profile = UserProfile(
+            telegram_user_id=1, budget_min=300, budget_max=900,
+            preferences=["foodie"], area="HSR", dietary_notes="vegetarian",
+            temporary_context="need to be back home by 9pm",  # dynamic-question answer
+            notes="usually free on weekends",
+            calendar_busy_text="Team sync (6:00 PM-7:00 PM)",  # attach_calendar_availability
+        )
+        other_signals = [
+            AgentSignal(user_id=2, stance="COUNTER", reason="too far east", counter_proposal="Cafe B"),
+        ]
+        candidates = [
+            VenueResult(name="Cafe A", address="HSR", rating=0, price_level=0),
+            VenueResult(name="Cafe B", address="Indiranagar", rating=0, price_level=0),
+        ]
+        goal_text = "plan dinner for us tonight (occasion: birthday)"
+
+        signal = get_agent_response(
+            profile, goal_text, "Cafe B", round_num=1, max_rounds=4,
+            candidates=candidates, other_signals=other_signals,
+        )
+
+        # The function itself still behaves normally with everything active.
+        self.assertEqual(signal.stance, "COUNTER")
+        self.assertEqual(signal.counter_proposal, "Cafe A")
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        user_message = mock_create.call_args.kwargs["messages"][0]["content"]
+
+        # Every context source actually made it into the request, none
+        # silently dropped by another block's string formatting.
+        self.assertIn("need to be back home by 9pm", system_prompt)  # temporary_context
+        self.assertIn("Team sync (6:00 PM-7:00 PM)", system_prompt)  # calendar_busy_text
+        self.assertIn("vegetarian", system_prompt)  # dietary_notes
+        self.assertIn("usually free on weekends", system_prompt)  # notes
+        self.assertIn("too far east", system_prompt)  # other_signals
+        self.assertIn("Cafe B", system_prompt)  # counter_proposal from other_signals + a candidate name
+        self.assertIn("Cafe A", system_prompt)  # candidate venue name
+        self.assertIn("birthday", user_message)  # occasion text, folded into goal_text
+
+        # Venue-grounding is still structurally enforced even with every
+        # other block also present.
+        sent_schema = mock_create.call_args.kwargs["output_config"]["format"]["schema"]
+        self.assertEqual(
+            set(sent_schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None}
+        )
+
+
 class TestBuildResponseSchema(unittest.TestCase):
     def test_no_candidates_falls_back_to_free_text(self):
         schema = _build_response_schema([])
