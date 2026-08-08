@@ -71,6 +71,15 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.mock_is_planning = is_planning_patch.start()
         self.addCleanup(is_planning_patch.stop)
 
+        # get_missing_info_question hits the Anthropic API for real — mocked
+        # to None (no question needed) by default so _gather_dynamic_context
+        # is a no-op and doesn't need message.get_bot() in these tests. Kept
+        # as its own attribute so the update-bypass test can assert it's
+        # never called at all on that path.
+        missing_info_patch = patch("choir.bot.handlers.get_missing_info_question", return_value=None)
+        self.mock_get_missing_info = missing_info_patch.start()
+        self.addCleanup(missing_info_patch.stop)
+
 
         run_patch = patch("choir.bot.handlers.run_negotiation")
         self.mock_run = run_patch.start()
@@ -188,6 +197,21 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.mock_is_planning.assert_not_called()
         self.mock_run.assert_called_once()
 
+    async def test_update_bypasses_dynamic_questions(self):
+        # An explicit revision command shouldn't trigger a fresh round of
+        # clarifying questions — the reason for changing already provides
+        # context, same rationale as skipping occasion-capture and
+        # intent-gating on this path.
+        self.mock_get_missing_info.return_value = "Would a real question ever be asked here?"
+        handlers._last_decision[200] = "Cafe Old"
+        message = make_message(chat_id=200, text="/choir update someone's running late")
+        await handlers.handle_choir_command(
+            make_update(message), make_context(["update", "someone's", "running", "late"])
+        )
+
+        self.mock_get_missing_info.assert_not_called()
+        self.mock_run.assert_called_once()
+
     async def test_redelivered_update_is_processed_only_once(self):
         # Telegram long-polling can redeliver the same update (a documented
         # real behavior) — without this guard, a redelivered /choir would
@@ -248,6 +272,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.record_negotiation_round"),
             patch("choir.bot.handlers.finish_negotiation_log"),
             patch("choir.bot.handlers.attach_calendar_availability"),
+            patch("choir.bot.handlers.get_missing_info_question", return_value=None),
         ]
         for p in self.patches:
             p.start()

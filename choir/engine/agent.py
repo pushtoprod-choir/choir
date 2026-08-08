@@ -214,3 +214,65 @@ same rule as never restating your exact budget numbers."""
         reason=reason,
         counter_proposal=counter_proposal,
     )
+
+
+_MISSING_INFO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "needs_question": {"type": "boolean"},
+        "question": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["needs_question", "question"],
+    "additionalProperties": False,
+}
+
+
+def get_missing_info_question(profile: UserProfile, goal_text: str) -> str | None:
+    """Dynamic-questions MVP — pre-round only, no mid-round follow-ups, no
+    stance/schema changes to get_agent_response or orchestrator.py at all.
+
+    Asks whether THIS specific request is missing something the person's
+    onboarding profile doesn't already cover, and if so, returns one short
+    question to ask them privately before round 1. Deliberately a separate,
+    smaller call from get_agent_response — this never touches the round loop
+    or the ACCEPT/REJECT/COUNTER contract.
+
+    Fails soft (returns None) on any error, same posture as
+    choir.bot.intent.is_planning_request — a broken classifier should
+    silently skip the optional question, never block or crash the negotiation.
+    """
+    system_prompt = f"""You are deciding whether to ask one clarifying question
+before privately negotiating on this person's behalf for a specific request.
+
+Known profile (do NOT ask about any of this — it's already answered):
+- Budget: {profile.budget_min}-{profile.budget_max}
+- Preferences: {", ".join(profile.preferences) or "none stated"}
+- Area: {profile.area}
+- Dietary notes: {profile.dietary_notes or "none"}
+- Other notes: {profile.notes or "none"}
+
+Current request: "{goal_text}"
+
+Identify at most ONE piece of information that is specific to THIS request,
+not already covered above, and would genuinely change how you'd negotiate on
+this person's behalf. Only ask if it's truly useful — don't ask just to ask.
+If nothing is missing, needs_question must be false and question must be null."""
+
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            system=system_prompt,
+            thinking={"type": "disabled"},
+            output_config={"format": {"type": "json_schema", "schema": _MISSING_INFO_SCHEMA}},
+            messages=[{"role": "user", "content": goal_text}],
+        )
+        text = next(block.text for block in response.content if block.type == "text")
+        data = json.loads(text)
+        return data["question"] if data["needs_question"] else None
+    except Exception:
+        logger.exception(
+            "Missing-info classification failed for user %s; skipping dynamic question",
+            profile.telegram_user_id,
+        )
+        return None

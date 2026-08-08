@@ -14,7 +14,7 @@ from unittest.mock import patch
 import anthropic
 import httpx
 
-from choir.engine.agent import _build_response_schema, get_agent_response
+from choir.engine.agent import _build_response_schema, get_agent_response, get_missing_info_question
 from choir.schemas import UserProfile, VenueResult
 
 PROFILE = UserProfile(telegram_user_id=1, budget_min=100, budget_max=500, preferences=["foodie"], area="HSR")
@@ -115,6 +115,65 @@ class TestBuildResponseSchema(unittest.TestCase):
     def test_candidates_constrain_to_an_exact_enum(self):
         schema = _build_response_schema(["Cafe A", "Cafe B"])
         self.assertEqual(set(schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None})
+
+
+class TestGetMissingInfoQuestion(unittest.TestCase):
+    """Offline tests for the dynamic-questions classifier (MVP: pre-round
+    only, no mid-round follow-ups). Mocks choir.engine.agent.client the same
+    way TestGetAgentResponse does — this function shares that client/model
+    but is otherwise fully independent of get_agent_response and never
+    touches the ACCEPT/REJECT/COUNTER stance contract."""
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_flags_a_question_when_something_plan_specific_is_missing(self, mock_create):
+        mock_create.return_value = text_response(
+            {"needs_question": True, "question": "Any time window that works best tomorrow?"}
+        )
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertEqual(question, "Any time window that works best tomorrow?")
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_returns_none_when_profile_already_covers_everything(self, mock_create):
+        mock_create.return_value = text_response({"needs_question": False, "question": None})
+        question = get_missing_info_question(PROFILE, "usual lunch spot, nothing fancy")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_api_error_falls_back_to_none_instead_of_raising(self, mock_create):
+        mock_create.side_effect = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com")
+        )
+
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_malformed_json_falls_back_to_none_instead_of_raising(self, mock_create):
+        mock_create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="not valid json at all")]
+        )
+
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_prompt_lists_every_known_profile_field_to_avoid_duplication(self, mock_create):
+        mock_create.return_value = text_response({"needs_question": False, "question": None})
+        profile = UserProfile(
+            telegram_user_id=1, budget_min=300, budget_max=900,
+            preferences=["foodie", "cafe_person"], area="Koramangala",
+            dietary_notes="vegetarian", notes="usually free on weekends",
+        )
+
+        get_missing_info_question(profile, "plan lunch for us tomorrow")
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        for known_fact in ("300-900", "foodie", "cafe_person", "Koramangala", "vegetarian", "usually free on weekends"):
+            self.assertIn(known_fact, system_prompt)
 
 
 if __name__ == "__main__":

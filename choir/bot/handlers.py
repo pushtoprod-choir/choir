@@ -21,6 +21,7 @@ from choir.store.profiles import (
     get_negotiation_history,
 )
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
+from choir.engine.agent import get_missing_info_question
 from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.venues.places import build_venue_query, find_venues
 from choir.venues.enrichment import enrich_venues
@@ -46,6 +47,18 @@ _pending_occasion: dict[int, str] = {}
 _last_decision: dict[int, str] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
+
+# user_id -> (chat_id, future) for an outstanding dynamic-question DM. Keyed
+# by user_id (not chat_id) since this is a private DM, not a group flow, and
+# is the first per-user (rather than per-chat) pending state in this file —
+# see _gather_dynamic_context for how a collision (same person flagged by two
+# concurrent negotiations) is handled.
+_pending_clarifications: dict[int, tuple[int, "asyncio.Future"]] = {}
+
+# Long enough to glance at a phone and reply, short enough that the group
+# doesn't feel like /choir hung. This is optional enrichment, not a hard
+# gate — a timeout just means proceeding without that person's answer.
+_CLARIFICATION_TIMEOUT_SECONDS = 45
 
 # Telegram's hard cap is 4096 chars; leave headroom below it since Markdown
 # entities and the surrounding reply text add to the same budget — this
@@ -175,6 +188,97 @@ def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
     return profiles, missing_users
 
 
+async def _gather_dynamic_context(message, profiles: list[UserProfile], goal_text: str) -> None:
+    """Pre-round-1 dynamic-questions phase (MVP: pre-round only, no mid-round
+    follow-ups, no changes to orchestrator.py's round loop or the
+    ACCEPT/REJECT/COUNTER contract). For each profile, asks its agent whether
+    this specific request is missing something onboarding didn't cover; DMs
+    whoever needs one, waits (bounded by _CLARIFICATION_TIMEOUT_SECONDS) for
+    replies, and folds answers into that profile's temporary_context IN
+    PLACE — same runtime-only, never-persisted pattern as
+    attach_calendar_availability populating calendar_busy_text. Best-effort:
+    a failed DM, a skip, or a timeout all just mean proceeding without that
+    person's answer, never blocking or crashing the negotiation."""
+    questions = await asyncio.gather(
+        *(asyncio.to_thread(get_missing_info_question, p, goal_text) for p in profiles)
+    )
+    flagged = [(p, q) for p, q in zip(profiles, questions) if q]
+    if not flagged:
+        return
+
+    loop = asyncio.get_event_loop()
+    bot = message.get_bot()
+    futures: dict[int, "asyncio.Future"] = {}
+
+    for profile, question in flagged:
+        user_id = profile.telegram_user_id
+        if user_id in _pending_clarifications:
+            # Already waiting on a clarification for this same person from a
+            # different concurrent negotiation (a different group) — fail
+            # open rather than clobber the other one's pending state or ask
+            # this person two questions from two bots-in-their-DMs at once.
+            continue
+        future = loop.create_future()
+        _pending_clarifications[user_id] = (message.chat_id, future)
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"Quick one before I negotiate on your behalf: {question}\n"
+                '(or reply "skip")',
+            )
+            futures[user_id] = future
+        except Exception:
+            logging.exception("Failed to DM clarifying question to user %s", user_id)
+            _pending_clarifications.pop(user_id, None)
+
+    if not futures:
+        return
+
+    done, _pending = await asyncio.wait(
+        futures.values(), timeout=_CLARIFICATION_TIMEOUT_SECONDS
+    )
+
+    for user_id, future in futures.items():
+        _pending_clarifications.pop(user_id, None)
+        if future in done:
+            answer = future.result()
+            if answer:
+                for profile in profiles:
+                    if profile.telegram_user_id == user_id:
+                        profile.temporary_context = answer
+                        break
+        else:
+            future.cancel()
+
+
+async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the plain-text DM reply to a dynamic clarifying question. A
+    no-op for every message except one from a user with an outstanding
+    clarification — mirrors handle_occasion_reply's shape, but keyed by
+    user_id (a DM) instead of chat_id (a group)."""
+    message = update.message
+    if (
+        message is None
+        or message.from_user is None
+        or message.from_user.is_bot
+        or not message.text
+    ):
+        return
+
+    user_id = message.from_user.id
+    pending = _pending_clarifications.get(user_id)
+    if pending is None:
+        return
+
+    _, future = pending
+    if future.done():
+        return
+
+    answer = message.text.strip()
+    future.set_result(None if answer.lower() in _SKIP_WORDS else answer)
+    await message.reply_text("Got it, thanks!")
+
+
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if message is None or message.from_user is None or message.from_user.is_bot:
@@ -283,7 +387,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
             f"We previously agreed on: {previous}. That needs to change because: {reason}. "
             f"Come up with an updated plan that addresses this."
         )
-        await _run_negotiation(message, goal_text)
+        await _run_negotiation(message, goal_text, skip_dynamic_questions=True)
         return
 
     goal_text = " ".join(args)
@@ -337,7 +441,9 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_negotiation(message, goal_text)
 
 
-async def _run_negotiation(message, goal_text: str):
+async def _run_negotiation(
+    message, goal_text: str, skip_dynamic_questions: bool = False
+):
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -353,6 +459,13 @@ async def _run_negotiation(message, goal_text: str):
     # None (its default) for anyone not connected or on any lookup failure,
     # so this is a no-op for groups where nobody's connected their calendar.
     await asyncio.to_thread(attach_calendar_availability, profiles)
+
+    # skip_dynamic_questions=True for "/choir update <reason>": an explicit
+    # revision command doesn't need re-clarifying — the reason for changing
+    # already provides fresh context, same rationale as skipping the
+    # occasion question and intent-gating on that path.
+    if not skip_dynamic_questions:
+        await _gather_dynamic_context(message, profiles, goal_text)
 
     request = NegotiationRequest(
         group_chat_id=message.chat_id,
