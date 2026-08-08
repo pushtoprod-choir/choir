@@ -103,6 +103,17 @@ def init_db():
         conn.execute("ALTER TABLE negotiations ADD COLUMN trip_id INTEGER")
     except sqlite3.OperationalError:
         pass
+    # plan_date is known before the negotiation starts (extracted from the
+    # /choir plan text); decided_time is only known if it converges — same
+    # ALTER pattern as trip_id, added after negotiations already existed.
+    try:
+        conn.execute("ALTER TABLE negotiations ADD COLUMN plan_date TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE negotiations ADD COLUMN decided_time TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS calendar_tokens (
             telegram_user_id INTEGER PRIMARY KEY,
@@ -193,16 +204,20 @@ def get_member_name(chat_id: int, user_id: int) -> str:
     return row[0] if row and row[0] else "Member"
 
 
-def start_negotiation_log(chat_id: int, goal_text: str, trip_id: int | None = None) -> int:
+def start_negotiation_log(
+    chat_id: int, goal_text: str, trip_id: int | None = None, plan_date: str | None = None
+) -> int:
     """Call before run_negotiation(). Returns a negotiation_id to pass to
     record_negotiation_round() and finish_negotiation_log(). trip_id links
     this negotiation to the chat's active trip, if any — None (the default)
-    means it isn't part of a trip."""
+    means it isn't part of a trip. plan_date is known up front (extracted
+    from the /choir plan text before negotiation starts), unlike
+    decided_time which is only known if it converges."""
     conn = _connect()
     cursor = conn.execute(
-        "INSERT INTO negotiations (chat_id, goal_text, started_at, converged, decision, trip_id) "
-        "VALUES (?, ?, datetime('now'), NULL, NULL, ?)",
-        (chat_id, goal_text, trip_id),
+        "INSERT INTO negotiations (chat_id, goal_text, started_at, converged, decision, trip_id, plan_date) "
+        "VALUES (?, ?, datetime('now'), NULL, NULL, ?, ?)",
+        (chat_id, goal_text, trip_id, plan_date),
     )
     conn.commit()
     negotiation_id = cursor.lastrowid
@@ -223,11 +238,14 @@ def record_negotiation_round(negotiation_id: int, round_num: int, signals_json: 
     conn.close()
 
 
-def finish_negotiation_log(negotiation_id: int, converged: bool, decision: str | None):
+def finish_negotiation_log(
+    negotiation_id: int, converged: bool, decision: str | None, decided_time: str | None = None
+):
     conn = _connect()
     conn.execute(
-        "UPDATE negotiations SET finished_at = datetime('now'), converged = ?, decision = ? WHERE id = ?",
-        (int(converged), decision, negotiation_id),
+        "UPDATE negotiations SET finished_at = datetime('now'), converged = ?, decision = ?, decided_time = ? "
+        "WHERE id = ?",
+        (int(converged), decision, decided_time, negotiation_id),
     )
     conn.commit()
     conn.close()
@@ -239,7 +257,8 @@ def get_negotiation_history(chat_id: int, limit: int = 10) -> list[dict]:
     without relying on Telegram's own message history."""
     conn = _connect()
     rows = conn.execute(
-        "SELECT id, goal_text, started_at, finished_at, converged, decision FROM negotiations "
+        "SELECT id, goal_text, started_at, finished_at, converged, decision, plan_date, decided_time "
+        "FROM negotiations "
         # Ordered by id, not started_at: started_at has only second-level
         # granularity (SQLite's datetime('now')), so two negotiations
         # starting in the same second would tie under a timestamp sort. The
@@ -256,6 +275,8 @@ def get_negotiation_history(chat_id: int, limit: int = 10) -> list[dict]:
             "finished_at": row[3],
             "converged": bool(row[4]) if row[4] is not None else None,
             "decision": row[5],
+            "plan_date": row[6],
+            "decided_time": row[7],
         }
         for row in rows
     ]
@@ -306,13 +327,19 @@ def get_trip_negotiations(trip_id: int) -> list[dict]:
     material end_trip() rolls up into a summary."""
     conn = _connect()
     rows = conn.execute(
-        "SELECT goal_text, converged, decision FROM negotiations "
+        "SELECT goal_text, converged, decision, plan_date, decided_time FROM negotiations "
         "WHERE trip_id = ? ORDER BY id ASC",
         (trip_id,),
     ).fetchall()
     conn.close()
     return [
-        {"goal_text": row[0], "converged": bool(row[1]) if row[1] is not None else None, "decision": row[2]}
+        {
+            "goal_text": row[0],
+            "converged": bool(row[1]) if row[1] is not None else None,
+            "decision": row[2],
+            "plan_date": row[3],
+            "decided_time": row[4],
+        }
         for row in rows
     ]
 

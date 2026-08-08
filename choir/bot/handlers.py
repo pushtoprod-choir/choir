@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import deque
+from datetime import datetime
 from urllib.parse import quote
 
 from telegram import Update
@@ -28,6 +29,7 @@ from choir.engine.orchestrator import format_transcript, run_negotiation
 from choir.venues.places import build_venue_query, find_venues
 from choir.venues.enrichment import enrich_venues
 from choir.bot.intent import is_planning_request
+from choir.bot.date_extraction import extract_plan_date
 from choir.calendar.client import attach_calendar_availability
 from choir.calendar.scheduling import create_events_for_connected
 
@@ -37,12 +39,19 @@ from choir.calendar.scheduling import create_events_for_connected
 # as long as we don't await between the check and the add.
 _active_negotiations: set[int] = set()
 
-# chat_id -> goal_text awaiting an occasion reply. Asked once per /choir
+
+@dataclasses.dataclass
+class _PendingPlan:
+    goal_text: str
+    plan_date: str   # "YYYY-MM-DD", already extracted and validated before the occasion question is asked
+
+
+# chat_id -> plan awaiting an occasion reply. Asked once per /choir plan
 # trigger before the actual negotiation starts: different reasons for the
 # same activity ("it's Priya's birthday" vs. "just a random Tuesday")
 # reasonably call for different tradeoffs, and the only way to know which is
 # to ask rather than assume.
-_pending_occasion: dict[int, str] = {}
+_pending_occasion: dict[int, _PendingPlan] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
 
@@ -161,6 +170,16 @@ async def _fallback_venue_suggestions(
     return _build_venues_text(venues, max_chars)
 
 
+def _format_plan_datetime(plan_date: str, decided_time: str) -> str:
+    """Human-readable rendering of the fixed plan_date plus the time the
+    agents actually converged on, e.g. "Saturday, August 15, 2026 at 7:30 PM"
+    — for the "Decision:" reply, not for anything downstream (the calendar
+    event uses the raw ISO values directly, see choir/calendar/scheduling.py)."""
+    date_part = datetime.strptime(plan_date, "%Y-%m-%d").strftime("%A, %B %d, %Y")
+    time_part = datetime.strptime(decided_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+    return f"{date_part} at {time_part}"
+
+
 def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
     member_ids = get_seen_members(chat_id)
     profiles = []
@@ -268,7 +287,11 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         trip_negotiations = get_trip_negotiations(active_trip["id"])
         decided = [n for n in trip_negotiations if n["converged"] and n["decision"]]
         summary = (
-            "\n".join(f"• {n['goal_text']}: {n['decision']}" for n in decided)
+            "\n".join(
+                f"• {n['goal_text']}: {n['decision']}"
+                + (f" on {n['plan_date']} at {n['decided_time']}" if n["plan_date"] and n["decided_time"] else "")
+                for n in decided
+            )
             if decided
             else "No decisions were finalized during this trip."
         )
@@ -336,7 +359,19 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    _pending_occasion[message.chat_id] = goal_text
+    # The date is fixed by this command and never negotiated — only the time
+    # is left for the agents to decide (see choir/engine). No date mentioned
+    # here means the command fails outright rather than guessing one.
+    plan_date = await asyncio.to_thread(extract_plan_date, goal_text)
+    if plan_date is None:
+        await message.reply_text(
+            "What date is this for? Include one and try again — e.g. "
+            "/choir plan dinner this Saturday",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    _pending_occasion[message.chat_id] = _PendingPlan(goal_text=goal_text, plan_date=plan_date)
     await message.reply_text(
         "Quick one before I start — what's the occasion? "
         '(e.g. birthday, casual hangout, work catch-up — or reply "skip")',
@@ -365,15 +400,16 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
     if chat_id not in _pending_occasion:
         return
 
-    goal_text = _pending_occasion.pop(chat_id)
+    pending = _pending_occasion.pop(chat_id)
+    goal_text = pending.goal_text
     occasion = message.text.strip()
     if occasion.lower() not in _SKIP_WORDS:
         goal_text = f"{goal_text} (occasion: {occasion})"
 
-    await _run_negotiation(message, goal_text)
+    await _run_negotiation(message, goal_text, pending.plan_date)
 
 
-async def _run_negotiation(message, goal_text: str):
+async def _run_negotiation(message, goal_text: str, plan_date: str):
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -394,6 +430,7 @@ async def _run_negotiation(message, goal_text: str):
         group_chat_id=message.chat_id,
         goal_text=goal_text,
         profiles=profiles,
+        plan_date=plan_date,
     )
 
     # Append-only audit log — written incrementally per round (not just at
@@ -405,7 +442,7 @@ async def _run_negotiation(message, goal_text: str):
     # later roll up every decision made while it was open.
     active_trip = get_active_trip(message.chat_id)
     trip_id = active_trip["id"] if active_trip else None
-    negotiation_id = start_negotiation_log(message.chat_id, goal_text, trip_id=trip_id)
+    negotiation_id = start_negotiation_log(message.chat_id, goal_text, trip_id=trip_id, plan_date=plan_date)
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
         lines = [f"🔁 *Round {round_num + 1}*"]
@@ -444,21 +481,28 @@ async def _run_negotiation(message, goal_text: str):
         _active_negotiations.discard(message.chat_id)
 
     finish_negotiation_log(
-        negotiation_id, converged=result.converged, decision=result.decision
+        negotiation_id, converged=result.converged, decision=result.decision, decided_time=result.decided_time
     )
 
     if result.converged:
-        reply = f"🎉 *Decision:* {result.decision}\n\n{result.explanation}"
+        reply = (
+            f"🎉 *Decision:* {result.decision}\n"
+            f"📅 {_format_plan_datetime(plan_date, result.decided_time)}\n\n"
+            f"{result.explanation}"
+        )
         if result.tradeoffs:
             reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
 
         # None means nobody in this group is calendar-connected — a true
         # no-op, keeping this line absent entirely for unconnected groups.
+        # The event is created at exactly plan_date + result.decided_time —
+        # both guaranteed present on convergence, no extraction guess needed.
         calendar_summary = await asyncio.to_thread(
-            create_events_for_connected, profiles, goal_text, result.decision
+            create_events_for_connected,
+            profiles, result.decision, plan_date, result.decided_time, result.decided_venue,
         )
         if calendar_summary is not None:
-            if calendar_summary.extraction_failed:
+            if calendar_summary.build_failed:
                 reply += "\n\n📅 Couldn't auto-schedule this — add it to your calendar manually."
             else:
                 reply += f"\n\n📅 Added to {calendar_summary.created}/{calendar_summary.connected} connected calendars."
