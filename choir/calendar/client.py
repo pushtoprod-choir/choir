@@ -79,12 +79,19 @@ def attach_calendar_availability(profiles: list[UserProfile]) -> None:
 
 def create_event(access_token: str, details: EventDetails) -> bool:
     start = datetime.fromisoformat(details.start_iso)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=_local_tz())
     end = start + timedelta(minutes=details.duration_minutes)
+    tz_name = os.environ.get("CHOIR_TIMEZONE", "Asia/Kolkata")
     body = {
         "summary": details.title,
         "location": details.location_text,
-        "start": {"dateTime": start.isoformat()},
-        "end": {"dateTime": end.isoformat()},
+        # Explicit timeZone alongside dateTime so Google Calendar can't
+        # interpret the same instant differently across participants'
+        # accounts — relying on the offset embedded in dateTime alone was
+        # what caused two people to see different clock times for one event.
+        "start": {"dateTime": start.isoformat(), "timeZone": tz_name},
+        "end": {"dateTime": end.isoformat(), "timeZone": tz_name},
     }
     try:
         response = requests.post(
