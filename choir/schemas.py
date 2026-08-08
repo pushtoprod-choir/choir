@@ -11,6 +11,7 @@ class UserProfile:
     area: str                    # e.g. "HSR Layout"
     dietary_notes: Optional[str] = None
     temporary_context: Optional[str] = None   # e.g. "saving money this month" — cleared after each negotiation
+    notes: Optional[str] = None   # free-text "anything else we should know" answer from onboarding
 
 
 @dataclass
@@ -53,4 +54,6 @@ class VenueResult:
     address: str
     rating: float
     price_level: int
+    lat: float = 0.0
+    lon: float = 0.0
     note: Optional[str] = None   # best-effort rating/price/vibe note from enrichment; None if unavailable

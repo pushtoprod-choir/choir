@@ -3,7 +3,7 @@ import logging
 import os
 
 from telegram import Update
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import ContextTypes
 
 from choir.store.profiles import get_profile, record_seen_member, get_seen_members, get_member_name
@@ -30,17 +30,24 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     message = update.message
 
     if message.chat.type == ChatType.PRIVATE:
-        await message.reply_text("/choir only works in a group — add me to one and try there.")
+        await message.reply_text(
+            "/choir only works in a group — add me to one and try there.", parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     goal_text = " ".join(context.args)  # everything after "/choir"
 
     if not goal_text:
-        await message.reply_text("Tell me what you want to plan — e.g. /choir plan lunch for us")
+        await message.reply_text(
+            "Tell me what you want to plan — e.g. /choir plan lunch for us", parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     if message.chat_id in _active_negotiations:
-        await message.reply_text("Already negotiating for this group — hang tight for that one to finish.")
+        await message.reply_text(
+            "Already negotiating for this group — hang tight for that one to finish.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     # /choir itself counts as being "seen" in this chat
@@ -62,14 +69,15 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(
             f"Some of you haven't set up Choir yet — tap this and hit Start: t.me/{bot_username}\n\n"
             f"Already did that? I can only see people who've sent at least one message in this group — "
-            f"say something here first, then try /choir again."
+            f"say something here first, then try /choir again.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     if not profiles:
         # Defensive — shouldn't happen since the /choir sender is always recorded above,
         # but a silent no-op is worse than a clear message if it ever does.
-        await message.reply_text("Couldn't find anyone set up in this group yet.")
+        await message.reply_text("Couldn't find anyone set up in this group yet.", parse_mode=ParseMode.MARKDOWN)
         return
 
     request = NegotiationRequest(
@@ -79,16 +87,16 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
-        lines = [f"Round {round_num + 1}:"]
+        lines = [f"*Round {round_num + 1}:*"]
         for s in signals:
-            name = get_member_name(message.chat_id, s.user_id) or f"User {s.user_id}"
+            name = get_member_name(message.chat_id, s.user_id)
             if s.stance == "ACCEPT":
-                lines.append(f"  {name}: accepted")
+                lines.append(f"  *{name}*: accepted")
             elif s.stance == "COUNTER":
-                lines.append(f"  {name}: countered — {s.reason}")
+                lines.append(f"  *{name}*: countered — {s.reason}")
             else:
-                lines.append(f"  {name}: rejected — {s.reason}")
-        await message.reply_text("\n".join(lines))
+                lines.append(f"  *{name}*: rejected — {s.reason}")
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
     # run_negotiation is synchronous; on_round is a coroutine, so drive it from a sync callback
     loop = asyncio.get_event_loop()
@@ -100,7 +108,10 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         result = await asyncio.to_thread(run_negotiation, request, sync_on_round)
     except NotImplementedError:
-        await message.reply_text("The negotiation engine isn't wired up yet — check back once it's built.")
+        await message.reply_text(
+            "The negotiation engine isn't wired up yet — check back once it's built.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
     finally:
         _active_negotiations.discard(message.chat_id)
@@ -114,26 +125,36 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         venues = await asyncio.to_thread(enrich_venues, venues, venue_query.purpose)
     venues_text = ""
     if venues:
-        venues_text = "\n\nReal options nearby:\n" + "\n".join(
-            f"- {v.name} ({v.address})" + (f" — {v.note}" if v.note else "") for v in venues
-        )
+        venue_lines = []
+        for v in venues:
+            line = f"- *{v.name}* ({v.address})"
+            if v.note:
+                line += f" — {v.note}"
+            if v.lat and v.lon:
+                line += f"\n  📍 https://www.google.com/maps?q={v.lat},{v.lon}"
+            venue_lines.append(line)
+        venues_text = "\n\n*Real options nearby:*\n" + "\n".join(venue_lines)
 
     if result.converged:
         reply = f"{result.decision}\n\n{result.explanation}"
         if result.tradeoffs:
-            reply += "\n\nWhy:\n" + "\n".join(f"- {t}" for t in result.tradeoffs)
-        await message.reply_text(reply + venues_text)
+            reply += "\n\n*Why:*\n" + "\n".join(f"- {t}" for t in result.tradeoffs)
+        await message.reply_text(reply + venues_text, parse_mode=ParseMode.MARKDOWN)
     else:
         options_text = "\n".join(f"- {opt}" for opt in result.top_options)
-        await message.reply_text(f"Couldn't fully agree — here are the top options:\n{options_text}{venues_text}")
+        await message.reply_text(
+            f"Couldn't fully agree — here are the top options:\n{options_text}{venues_text}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     # The proof this was a real negotiation, not a single hidden API call —
     # sent as a follow-up so the main decision stays the headline message.
     if result.rounds:
-        transcript = format_transcript(result.rounds)
+        resolve_name = lambda user_id: get_member_name(message.chat_id, user_id)
+        transcript = format_transcript(result.rounds, resolve_name)
         if len(transcript) > 3500:
-            transcript = format_transcript(result.rounds[-2:]) + "\n\n(earlier rounds omitted for length)"
+            transcript = format_transcript(result.rounds[-2:], resolve_name) + "\n\n(earlier rounds omitted for length)"
         try:
-            await message.reply_text("See how we got here:\n\n" + transcript)
+            await message.reply_text("See how we got here:\n\n" + transcript, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             logging.exception("Failed to send negotiation transcript")

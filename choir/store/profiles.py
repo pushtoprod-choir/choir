@@ -18,6 +18,13 @@ def init_db():
             temporary_context TEXT
         )
     """)
+    # profiles may already exist from before the onboarding free-text step was
+    # added — ALTER rather than rely on CREATE TABLE IF NOT EXISTS, which
+    # won't add columns to an existing table.
+    try:
+        conn.execute("ALTER TABLE profiles ADD COLUMN notes TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS seen_members (
             chat_id INTEGER,
@@ -39,11 +46,13 @@ def init_db():
 def save_profile(profile: UserProfile):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
-        INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO profiles
+            (telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         profile.telegram_user_id, profile.budget_min, profile.budget_max,
         json.dumps(profile.preferences), profile.area,
-        profile.dietary_notes, profile.temporary_context,
+        profile.dietary_notes, profile.temporary_context, profile.notes,
     ))
     conn.commit()
     conn.close()
@@ -51,14 +60,18 @@ def save_profile(profile: UserProfile):
 
 def get_profile(telegram_user_id: int) -> UserProfile | None:
     conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT * FROM profiles WHERE telegram_user_id = ?", (telegram_user_id,)).fetchone()
+    row = conn.execute(
+        "SELECT telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, "
+        "notes FROM profiles WHERE telegram_user_id = ?",
+        (telegram_user_id,),
+    ).fetchone()
     conn.close()
     if row is None:
         return None
     return UserProfile(
         telegram_user_id=row[0], budget_min=row[1], budget_max=row[2],
         preferences=json.loads(row[3]), area=row[4],
-        dietary_notes=row[5], temporary_context=row[6],
+        dietary_notes=row[5], temporary_context=row[6], notes=row[7],
     )
 
 
@@ -76,9 +89,13 @@ def record_seen_member(chat_id: int, user_id: int, first_name: str | None = None
         (chat_id, user_id, first_name),
     )
     if first_name is not None:
+        # first_name is a property of the person, not the chat — backfill it
+        # across every chat this user_id has a row in, not just this one, so
+        # a name learned in one group (or during onboarding) fixes stale NULL
+        # rows left over from before first_name existed.
         conn.execute(
-            "UPDATE seen_members SET first_name = ? WHERE chat_id = ? AND user_id = ?",
-            (first_name, chat_id, user_id),
+            "UPDATE seen_members SET first_name = ? WHERE user_id = ?",
+            (first_name, user_id),
         )
     conn.commit()
     conn.close()
@@ -91,11 +108,13 @@ def get_seen_members(chat_id: int) -> list[int]:
     return [row[0] for row in rows]
 
 
-def get_member_name(chat_id: int, user_id: int) -> str | None:
+def get_member_name(chat_id: int, user_id: int) -> str:
+    # Raw Telegram IDs should never be shown to the group — "Member" is the
+    # fallback whenever a name isn't on file for any reason.
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
         "SELECT first_name FROM seen_members WHERE chat_id = ? AND user_id = ?",
         (chat_id, user_id),
     ).fetchone()
     conn.close()
-    return row[0] if row else None
+    return row[0] if row and row[0] else "Member"

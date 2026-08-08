@@ -16,8 +16,8 @@ logger = logging.getLogger(__name__)
 
 client = Anthropic()
 
-MODEL = "not-a-real-model"
-# MODEL = "claude-haiku-4-5"
+# MODEL = "not-a-real-model"
+MODEL = "claude-haiku-4-5"
 # MODEL = "claude-sonnet-5"
 
 ENRICH_TIMEOUT_SECONDS = 8
@@ -60,6 +60,8 @@ def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
                 address=v.address,
                 rating=v.rating,
                 price_level=v.price_level,
+                lat=v.lat,
+                lon=v.lon,
                 note=(note.get("note") or None) if isinstance(note, dict) else None,
             )
             for v, note in zip(venues, notes)

@@ -23,6 +23,8 @@ PURPOSE_TAGS = {
     "casual_lunch": "restaurant",
     "drinks": "bar",
     "work_meeting": "cafe",
+    "activity": "bowling alley OR arcade OR escape room",
+    "outdoor": "park",
 }
 DEFAULT_PURPOSE = "casual_lunch"
 
@@ -33,6 +35,8 @@ PURPOSE_KEYWORDS = {
     "drinks": ["drink", "bar", "beer", "cocktail", "pub"],
     "work_meeting": ["work", "meeting", "call", "sync", "standup", "wifi"],
     "casual_lunch": ["lunch", "dinner", "breakfast", "eat", "food", "meal", "brunch"],
+    "activity": ["bowling", "arcade", "escape room", "escape", "mini golf", "minigolf", "game", "activity"],
+    "outdoor": ["park", "picnic", "outdoor", "hike", "hiking", "trail", "walk"],
 }
 
 
@@ -115,6 +119,15 @@ def find_venues(query: VenueQuery, api_key: str) -> list[VenueResult]:
             address=place.get("display_name", ""),
             rating=0.0,
             price_level=0,
+            lat=_safe_float(place.get("lat")),
+            lon=_safe_float(place.get("lon")),
         )
         for place in places
     ]
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

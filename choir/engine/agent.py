@@ -63,7 +63,10 @@ Decide your stance on the current proposal:
 - COUNTER when you can suggest a concrete, specific alternative that would
   better fit this person (e.g. a particular venue type, time, or area) —
   in that case "counter_proposal" must describe it in one short phrase.
-Otherwise leave "counter_proposal" null."""
+Otherwise leave "counter_proposal" null.
+
+Also factor in timing. If you have a schedule constraint, say so in your reason.
+If proposing a COUNTER, include a suggested time alongside the place."""
 
     if current_proposal:
         user_message = f"The group wants to: {goal_text}\nCurrent proposal on the table: {current_proposal}"
