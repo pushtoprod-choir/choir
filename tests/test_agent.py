@@ -15,7 +15,7 @@ import anthropic
 import httpx
 
 from choir.engine.agent import _build_response_schema, get_agent_response
-from choir.schemas import UserProfile, VenueResult
+from choir.schemas import AgentSignal, UserProfile, VenueResult
 
 PROFILE = UserProfile(telegram_user_id=1, budget_min=100, budget_max=500, preferences=["foodie"], area="HSR")
 
@@ -105,6 +105,31 @@ class TestGetAgentResponse(unittest.TestCase):
 
         sent_schema = mock_create.call_args.kwargs["output_config"]["format"]["schema"]
         self.assertEqual(set(sent_schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None})
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_other_signals_are_summarized_into_the_prompt(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "COUNTER", "reason": "compromise", "counter_proposal": "Cafe Mid"}
+        )
+        other_signals = [
+            AgentSignal(user_id=2, stance="COUNTER", reason="too far east", counter_proposal="Whitefield"),
+        ]
+        get_agent_response(PROFILE, "plan lunch", "Cafe A", 1, 4, other_signals=other_signals)
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        self.assertIn("What everyone else in the group said last round:", system_prompt)
+        self.assertIn("too far east", system_prompt)
+        self.assertIn("Whitefield", system_prompt)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_no_other_signals_omits_the_summary_block(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "COUNTER", "reason": "fine", "counter_proposal": "Cafe A"}
+        )
+        get_agent_response(PROFILE, "plan lunch", None, 0, 4)
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        self.assertNotIn("What everyone else in the group said last round:", system_prompt)
 
 
 class TestBuildResponseSchema(unittest.TestCase):
