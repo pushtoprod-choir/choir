@@ -130,6 +130,20 @@ def get_agent_response(
     else:
         others_block = ""
 
+    if profile.preferences:
+        # Confidence (0-1) reflects how consistently this specific tag has
+        # actually mattered for this person across past real negotiations —
+        # nudged after every negotiation based on whether they ended up
+        # accepting or not (see choir.store.profiles.update_preference_confidence).
+        # A tag with no history yet sits at the same starting point everyone
+        # begins at (DEFAULT_CONFIDENCE), so this is never a cold, meaningless 0.
+        preferences_block = ", ".join(
+            f"{tag} (confidence {profile.preference_confidence.get(tag, 0.6):.2f})"
+            for tag in profile.preferences
+        )
+    else:
+        preferences_block = "none stated"
+
     time_block = (
         f"\nThe date is fixed and not up for discussion: {plan_date}. "
         + (
@@ -145,7 +159,10 @@ else's budget or constraints, and your "reason" is shown to the whole group,
 so never restate exact numbers from the budget range below.
 
 Budget range: {profile.budget_min}-{profile.budget_max}
-Preferences: {", ".join(profile.preferences) or "none stated"}
+Preferences (with a confidence score 0-1 showing how consistently this tag
+has actually mattered for this person across past negotiations — weigh a
+higher-confidence tag more heavily than a lower one when they conflict):
+{preferences_block}
 Area: {profile.area}
 Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}

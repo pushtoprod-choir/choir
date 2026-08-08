@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 import choir.store.profiles as profiles
+from choir.schemas import UserProfile
 
 
 class TestNegotiationLog(unittest.TestCase):
@@ -141,6 +142,105 @@ class TestTrips(unittest.TestCase):
         active = profiles.get_active_trip(chat_id=100)
         self.assertEqual(active["id"], second_id)
         self.assertNotEqual(first_id, second_id)
+
+
+class TestCalendarEvents(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        self._original_db_path = profiles.DB_PATH
+        profiles.DB_PATH = path
+        self.addCleanup(setattr, profiles, "DB_PATH", self._original_db_path)
+        profiles.init_db()
+
+    def test_no_events_recorded_by_default(self):
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=1), {})
+
+    def test_records_and_reads_back_events_per_negotiation(self):
+        profiles.record_calendar_events(negotiation_id=1, event_ids={10: "evt-a", 20: "evt-b"})
+
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=1), {10: "evt-a", 20: "evt-b"})
+        # A different negotiation_id must not see these — this is what lets a
+        # /choir update clean up exactly the OLD negotiation's events, not
+        # every event ever created for the chat.
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=2), {})
+
+    def test_recording_with_an_empty_dict_is_a_safe_no_op(self):
+        profiles.record_calendar_events(negotiation_id=1, event_ids={})
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=1), {})
+
+    def test_delete_calendar_event_records_removes_only_that_negotiations_rows(self):
+        profiles.record_calendar_events(negotiation_id=1, event_ids={10: "evt-a"})
+        profiles.record_calendar_events(negotiation_id=2, event_ids={10: "evt-c"})
+
+        profiles.delete_calendar_event_records(negotiation_id=1)
+
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=1), {})
+        self.assertEqual(profiles.get_calendar_events(negotiation_id=2), {10: "evt-c"})
+
+
+class TestPreferenceConfidence(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        self._original_db_path = profiles.DB_PATH
+        profiles.DB_PATH = path
+        self.addCleanup(setattr, profiles, "DB_PATH", self._original_db_path)
+        profiles.init_db()
+
+        self.profile = UserProfile(
+            telegram_user_id=1, budget_min=100, budget_max=500,
+            preferences=["vegetarian", "quiet_places"], area="HSR",
+        )
+        profiles.save_profile(self.profile)
+
+    def test_freshly_saved_profile_has_no_confidence_entries_yet(self):
+        loaded = profiles.get_profile(1)
+        self.assertEqual(loaded.preference_confidence, {})
+
+    def test_acceptance_nudges_every_stated_tag_up_from_the_default(self):
+        profiles.update_preference_confidence(telegram_user_id=1, accepted=True)
+
+        loaded = profiles.get_profile(1)
+        expected = round(profiles.DEFAULT_CONFIDENCE + profiles.CONFIDENCE_STEP, 3)
+        self.assertEqual(loaded.preference_confidence["vegetarian"], expected)
+        self.assertEqual(loaded.preference_confidence["quiet_places"], expected)
+
+    def test_non_acceptance_nudges_down_from_the_default(self):
+        profiles.update_preference_confidence(telegram_user_id=1, accepted=False)
+
+        loaded = profiles.get_profile(1)
+        expected = round(profiles.DEFAULT_CONFIDENCE - profiles.CONFIDENCE_STEP, 3)
+        self.assertEqual(loaded.preference_confidence["vegetarian"], expected)
+
+    def test_repeated_negotiations_compound_and_visibly_shift_over_time(self):
+        for _ in range(3):
+            profiles.update_preference_confidence(telegram_user_id=1, accepted=True)
+
+        loaded = profiles.get_profile(1)
+        expected = round(profiles.DEFAULT_CONFIDENCE + 3 * profiles.CONFIDENCE_STEP, 3)
+        self.assertEqual(loaded.preference_confidence["vegetarian"], expected)
+
+    def test_confidence_is_clamped_to_the_0_to_1_range(self):
+        for _ in range(50):
+            profiles.update_preference_confidence(telegram_user_id=1, accepted=True)
+        self.assertEqual(profiles.get_profile(1).preference_confidence["vegetarian"], 1.0)
+
+        for _ in range(50):
+            profiles.update_preference_confidence(telegram_user_id=1, accepted=False)
+        self.assertEqual(profiles.get_profile(1).preference_confidence["vegetarian"], 0.0)
+
+    def test_unknown_user_is_a_safe_no_op(self):
+        profiles.update_preference_confidence(telegram_user_id=999, accepted=True)  # must not raise
+
+    def test_profile_with_no_stated_preferences_is_a_safe_no_op(self):
+        profiles.save_profile(UserProfile(
+            telegram_user_id=2, budget_min=100, budget_max=500, preferences=[], area="HSR",
+        ))
+        profiles.update_preference_confidence(telegram_user_id=2, accepted=True)
+        self.assertEqual(profiles.get_profile(2).preference_confidence, {})
 
 
 if __name__ == "__main__":

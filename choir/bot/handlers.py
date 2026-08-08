@@ -19,10 +19,13 @@ from choir.store.profiles import (
     start_negotiation_log,
     record_negotiation_round,
     finish_negotiation_log,
+    get_negotiation_history,
     start_trip,
     get_active_trip,
     end_trip,
     get_trip_negotiations,
+    update_preference_confidence,
+    record_calendar_events,
 )
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
 from choir.engine.agent import get_missing_info_question
@@ -33,7 +36,7 @@ from choir.actions.links import build_ride_deeplink, describe_ride_suggestion, f
 from choir.bot.intent import is_planning_request
 from choir.bot.date_extraction import extract_plan_date
 from choir.calendar.client import attach_calendar_availability
-from choir.calendar.scheduling import create_events_for_connected
+from choir.calendar.scheduling import create_events_for_connected, delete_events_for_negotiation
 
 # Chats with a negotiation currently in flight — guards against a second
 # /choir stomping on a running one (e.g. someone double-tapping the command).
@@ -54,6 +57,21 @@ class _PendingPlan:
 # reasonably call for different tradeoffs, and the only way to know which is
 # to ask rather than assume.
 _pending_occasion: dict[int, _PendingPlan] = {}
+
+# chat_id -> the most recent converged decision, so "/choir update <reason>"
+# has something concrete to revise instead of starting blind.
+_last_decision: dict[int, str] = {}
+
+# chat_id -> that decision's negotiation_id, so a later "/choir update" can
+# find and delete exactly the calendar events created for it before creating
+# new ones for the revised plan — without this a revised plan just stacks a
+# duplicate event on top of the stale one instead of replacing it.
+_last_negotiation_id: dict[int, int] = {}
+
+# chat_id -> that decision's plan_date, carried forward unchanged by a later
+# "/choir update <reason>" unless the reason itself names a new date — most
+# revisions (a venue swap, someone running late) don't touch the date at all.
+_last_plan_date: dict[int, str] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
 
@@ -370,6 +388,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "Here's what I understand:\n"
             "/choir start trip <title> — kick off a new trip\n"
             "/choir plan <what you want> — negotiate something within the current trip\n"
+            "/choir update <what changed> — revise the last decision\n"
             "/choir end trip — wrap up the current trip",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -393,15 +412,17 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     is_start_trip = command == "start" and len(args) >= 2 and args[1].lower() == "trip"
     is_end_trip = command == "end" and len(args) >= 2 and args[1].lower() == "trip"
     is_plan = command == "plan"
+    is_update = command == "update"
 
-    # Only these three forms are recognized — anything else (including the
-    # old "/choir <freeform goal>" and "/choir update <reason>" forms) is
-    # rejected outright rather than guessed at.
-    if not (is_start_trip or is_end_trip or is_plan):
+    # Only these four forms are recognized — anything else (including the
+    # old bare "/choir <freeform goal>" form) is rejected outright rather
+    # than guessed at.
+    if not (is_start_trip or is_end_trip or is_plan or is_update):
         await message.reply_text(
             "I only understand:\n"
             "/choir start trip <title>\n"
             "/choir plan <what you want>\n"
+            "/choir update <what changed>\n"
             "/choir end trip",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -487,6 +508,64 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if is_update:
+        previous = _last_decision.get(message.chat_id)
+        previous_negotiation_id = _last_negotiation_id.get(message.chat_id)
+        previous_plan_date = _last_plan_date.get(message.chat_id)
+        if previous is None:
+            # In-memory state doesn't survive a restart — the persisted log
+            # does. Falls back to it so "/choir update" still works after
+            # the bot process restarts, not just within one continuous run.
+            history = get_negotiation_history(message.chat_id, limit=5)
+            match = next(
+                (h for h in history if h["converged"] and h["decision"]),
+                None,
+            )
+            if match:
+                previous = match["decision"]
+                previous_negotiation_id = match["id"]
+                previous_plan_date = match["plan_date"]
+        if previous is None:
+            await message.reply_text(
+                "There's no previous plan for this group to update yet — use /choir plan <what you want> to start one.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        reason = " ".join(args[1:]).strip()
+        if not reason:
+            await message.reply_text(
+                "Tell me why it needs to change — e.g. /choir update someone's running late",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        # Seeded with the old decision so the agents revise instead of
+        # re-negotiating from scratch — an update skips both the occasion
+        # question (the reason for changing already provides that context)
+        # and intent-gating below (an explicit revision command doesn't need
+        # classifying, and a reason like "someone's running late" would very
+        # plausibly fail a "is this a planning request" check on its own).
+        goal_text = (
+            f"We previously agreed on: {previous}. That needs to change because: {reason}. "
+            f"Come up with an updated plan that addresses this."
+        )
+        # The revision reason might itself name a new date (e.g. "let's push
+        # it to next Saturday instead") — try that first, otherwise carry the
+        # original plan's date forward unchanged, since most revisions (a
+        # venue swap, someone running late) don't touch the date at all.
+        plan_date = await asyncio.to_thread(extract_plan_date, reason) or previous_plan_date
+        if plan_date is None:
+            await message.reply_text(
+                "What date is this for? Include one and try again — e.g. "
+                "/choir update moved to Sunday instead",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await _run_negotiation(
+            message, goal_text, plan_date, skip_dynamic_questions=True,
+            replaces_negotiation_id=previous_negotiation_id,
+        )
+        return
+
     goal_text = " ".join(args[1:]).strip()
     if not goal_text:
         await message.reply_text(
@@ -558,8 +637,14 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _run_negotiation(
-    message, goal_text: str, plan_date: str, skip_dynamic_questions: bool = False
+    message, goal_text: str, plan_date: str, skip_dynamic_questions: bool = False,
+    replaces_negotiation_id: int | None = None,
 ):
+    """replaces_negotiation_id, when set (only by the /choir update path),
+    is the negotiation whose calendar events (if any) should be deleted once
+    this one produces a new decision — see the calendar-replace block below.
+    A plain new /choir plan on an unrelated topic leaves this None, since
+    that's a separate plan, not a revision of an existing one."""
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -641,7 +726,31 @@ async def _run_negotiation(
         negotiation_id, converged=result.converged, decision=result.decision, decided_time=result.decided_time
     )
 
+    # Nudges each person's own preference confidence based on THEIR final-round
+    # stance (not the group's overall convergence) — someone who was still
+    # countering when the round budget ran out gets a real negative signal
+    # even if two other people happened to accept something. Runs every time,
+    # converged or not: a non-convergent negotiation is exactly the kind of
+    # outcome that should count against whatever this person was holding out
+    # for. See choir.store.profiles.update_preference_confidence for why this
+    # is a coarse, un-attributed signal rather than per-tag classification.
+    if result.rounds:
+        final_stances = {s.user_id: s.stance for s in result.rounds[-1]}
+        for profile in profiles:
+            stance = final_stances.get(profile.telegram_user_id)
+            if stance is not None:
+                await asyncio.to_thread(
+                    update_preference_confidence, profile.telegram_user_id, stance == "ACCEPT"
+                )
+
     if result.converged:
+        # Remembered so a later "/choir update <reason>" has something to
+        # revise, knows which negotiation's calendar events to replace, and
+        # (absent a new date in the revision reason) which date to carry
+        # forward unchanged.
+        _last_decision[message.chat_id] = result.decision
+        _last_negotiation_id[message.chat_id] = negotiation_id
+        _last_plan_date[message.chat_id] = plan_date
         reply = (
             f"🎉 *Decision:* {result.decision}\n"
             f"📅 {_format_plan_datetime(plan_date, result.decided_time)}\n\n"
@@ -649,6 +758,15 @@ async def _run_negotiation(
         )
         if result.tradeoffs:
             reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
+
+        # A /choir update revising an earlier decision: clean up whatever
+        # calendar events that earlier negotiation created BEFORE creating
+        # new ones for this one, so revising a plan replaces its calendar
+        # event instead of stacking a duplicate on top of the stale one.
+        # Best-effort — a cleanup miss here must never block the new
+        # negotiation's own calendar creation below.
+        if replaces_negotiation_id is not None:
+            await asyncio.to_thread(delete_events_for_negotiation, replaces_negotiation_id)
 
         # None means nobody in this group is calendar-connected — a true
         # no-op, keeping this line absent entirely for unconnected groups.
@@ -663,6 +781,10 @@ async def _run_negotiation(
                 reply += "\n\n📅 Couldn't auto-schedule this — add it to your calendar manually."
             else:
                 reply += f"\n\n📅 Added to {calendar_summary.created}/{calendar_summary.connected} connected calendars."
+            if calendar_summary.event_ids:
+                # Tied to THIS negotiation_id, not replaces_negotiation_id —
+                # so the next /choir update (if any) cleans up from here.
+                await asyncio.to_thread(record_calendar_events, negotiation_id, calendar_summary.event_ids)
 
         if result.decided_venue:
             # The decision IS a real, negotiated-over venue already (the

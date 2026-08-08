@@ -4,6 +4,17 @@ from choir.schemas import UserProfile
 
 DB_PATH = "choir.db"
 
+# Starting confidence for a preference tag that's never been through a real
+# negotiation outcome yet (e.g. freshly stated at onboarding) — see
+# plan.md's Phase 8.1 sketch, which picked the same number: high enough that
+# a stated preference is taken seriously immediately, low enough that it can
+# still visibly move in either direction after just one or two negotiations.
+DEFAULT_CONFIDENCE = 0.6
+# Deliberately small and boring per plan.md's own reasoning: this doesn't
+# need to be sophisticated to feel smart in a demo, it needs to visibly
+# shift over a few real negotiations, not swing wildly on one data point.
+CONFIDENCE_STEP = 0.05
+
 
 def _connect() -> sqlite3.Connection:
     # timeout=10: wait up to 10s for a lock instead of failing immediately
@@ -36,6 +47,14 @@ def init_db():
     # won't add columns to an existing table.
     try:
         conn.execute("ALTER TABLE profiles ADD COLUMN notes TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # preference_confidence may be absent on a profile row created before
+    # this feature existed — ALTER guard, same pattern as `notes` above.
+    # NULL/missing means "no tag has ever gone through get_profile's
+    # default-fill yet", not "confidence zero" (see get_profile below).
+    try:
+        conn.execute("ALTER TABLE profiles ADD COLUMN preference_confidence TEXT")
     except sqlite3.OperationalError:
         pass
     conn.execute("""
@@ -123,6 +142,18 @@ def init_db():
             connected_at INTEGER
         )
     """)
+    # One row per (negotiation, person) whose calendar got a real event
+    # created for that negotiation's decision — lets a later /choir update
+    # find and delete exactly these events before creating new ones, instead
+    # of stacking a duplicate event on top of a plan that's since changed.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS calendar_events (
+            negotiation_id INTEGER,
+            telegram_user_id INTEGER,
+            event_id TEXT,
+            PRIMARY KEY (negotiation_id, telegram_user_id)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -131,12 +162,14 @@ def save_profile(profile: UserProfile):
     conn = _connect()
     conn.execute("""
         INSERT OR REPLACE INTO profiles
-            (telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, notes,
+             preference_confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         profile.telegram_user_id, profile.budget_min, profile.budget_max,
         json.dumps(profile.preferences), profile.area,
         profile.dietary_notes, profile.temporary_context, profile.notes,
+        json.dumps(profile.preference_confidence or {}),
     ))
     conn.commit()
     conn.close()
@@ -146,17 +179,49 @@ def get_profile(telegram_user_id: int) -> UserProfile | None:
     conn = _connect()
     row = conn.execute(
         "SELECT telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, "
-        "notes FROM profiles WHERE telegram_user_id = ?",
+        "notes, preference_confidence FROM profiles WHERE telegram_user_id = ?",
         (telegram_user_id,),
     ).fetchone()
     conn.close()
     if row is None:
         return None
+    # NULL for anyone onboarded before this column existed, or before any
+    # negotiation has run for them yet — an empty dict, not a crash.
+    confidence = json.loads(row[8]) if row[8] else {}
     return UserProfile(
         telegram_user_id=row[0], budget_min=row[1], budget_max=row[2],
         preferences=json.loads(row[3]), area=row[4],
         dietary_notes=row[5], temporary_context=row[6], notes=row[7],
+        preference_confidence=confidence,
     )
+
+
+def update_preference_confidence(telegram_user_id: int, accepted: bool):
+    """Called once per person after every negotiation resolves (converged or
+    not), based on THEIR final-round stance — not the group's overall
+    outcome, since one person accepting a compromise they don't love is a
+    different signal than one person who never budged. Nudges every tag this
+    person stated at onboarding by +/- CONFIDENCE_STEP, clamped to [0, 1].
+    Deliberately doesn't try to attribute the outcome to any ONE specific
+    tag (e.g. "budget mattered here, quiet_places didn't") — that needs a
+    real classification step this hackathon-scale version skips in favor of
+    a signal that's simple enough to trust and cheap enough to run every
+    time."""
+    profile = get_profile(telegram_user_id)
+    if profile is None or not profile.preferences:
+        return
+    delta = CONFIDENCE_STEP if accepted else -CONFIDENCE_STEP
+    updated = dict(profile.preference_confidence)
+    for tag in profile.preferences:
+        current = updated.get(tag, DEFAULT_CONFIDENCE)
+        updated[tag] = round(max(0.0, min(1.0, current + delta)), 3)
+    conn = _connect()
+    conn.execute(
+        "UPDATE profiles SET preference_confidence = ? WHERE telegram_user_id = ?",
+        (json.dumps(updated), telegram_user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def clear_temporary_context(telegram_user_id: int):
@@ -350,6 +415,42 @@ def end_trip(trip_id: int, summary: str | None):
         "UPDATE trips SET ended_at = datetime('now'), status = 'ended', summary = ? WHERE id = ?",
         (summary, trip_id),
     )
+    conn.commit()
+    conn.close()
+
+
+def record_calendar_events(negotiation_id: int, event_ids: dict[int, str]):
+    """One row per person whose calendar actually got an event for this
+    negotiation's decision — see get_calendar_events/delete_calendar_event_records,
+    which a later /choir update uses to clean these up before creating new ones."""
+    if not event_ids:
+        return
+    conn = _connect()
+    conn.executemany(
+        "INSERT OR REPLACE INTO calendar_events (negotiation_id, telegram_user_id, event_id) VALUES (?, ?, ?)",
+        [(negotiation_id, user_id, event_id) for user_id, event_id in event_ids.items()],
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_calendar_events(negotiation_id: int) -> dict[int, str]:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT telegram_user_id, event_id FROM calendar_events WHERE negotiation_id = ?",
+        (negotiation_id,),
+    ).fetchall()
+    conn.close()
+    return {row[0]: row[1] for row in rows}
+
+
+def delete_calendar_event_records(negotiation_id: int):
+    """Removes the bookkeeping rows only — actually deleting the events on
+    Google's side is choir.calendar.scheduling.delete_events_for_negotiation's
+    job, since that needs a live access token per person, which this
+    DB-only module has no business knowing about."""
+    conn = _connect()
+    conn.execute("DELETE FROM calendar_events WHERE negotiation_id = ?", (negotiation_id,))
     conn.commit()
     conn.close()
 
