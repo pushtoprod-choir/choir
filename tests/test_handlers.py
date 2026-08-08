@@ -43,6 +43,7 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         handlers._active_negotiations.clear()
         handlers._pending_occasion.clear()
         handlers._last_decision.clear()
+        handlers._last_negotiation_id.clear()
         handlers._processed_update_ids.clear()
         handlers._processed_update_id_order.clear()
 
@@ -58,6 +59,9 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.get_active_trip", return_value=None),
             patch("choir.bot.handlers.attach_calendar_availability"),
             patch("choir.bot.handlers.create_events_for_connected", return_value=None),
+            patch("choir.bot.handlers.delete_events_for_negotiation"),
+            patch("choir.bot.handlers.record_calendar_events"),
+            patch("choir.bot.handlers.update_preference_confidence"),
         ]
         for p in self.patches:
             p.start()
@@ -142,6 +146,28 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Cafe Old", goal_text)
         self.assertIn("running late", goal_text)
 
+    async def test_update_replaces_the_prior_negotiations_calendar_events(self):
+        # Regression test for the "add, then remove, then re-add" calendar
+        # mess: a /choir update that lands on a new decision must clean up
+        # whatever calendar events the negotiation IT'S REVISING created,
+        # before creating new ones — not leave the stale event stacked
+        # alongside the new one.
+        handlers._last_decision[200] = "Cafe Old"
+        handlers._last_negotiation_id[200] = 7
+        with patch("choir.bot.handlers.delete_events_for_negotiation") as mock_delete, \
+             patch("choir.bot.handlers.record_calendar_events") as mock_record, \
+             patch(
+                 "choir.bot.handlers.create_events_for_connected",
+                 return_value=SimpleNamespace(created=1, connected=1, extraction_failed=False, event_ids={1: "evt-new"}),
+             ):
+            message = make_message(chat_id=200, text="/choir update someone's running late")
+            await handlers.handle_choir_command(
+                make_update(message), make_context(["update", "someone's", "running", "late"])
+            )
+
+        mock_delete.assert_called_once_with(7)
+        mock_record.assert_called_once_with(1, {1: "evt-new"})  # 1 == the mocked start_negotiation_log return value
+
     async def test_converged_negotiation_is_remembered_for_a_future_update(self):
         message = make_message(chat_id=100, text="/choir plan lunch")
         await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
@@ -149,6 +175,34 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         await handlers.handle_occasion_reply(make_update(reply_message), None)
 
         self.assertEqual(handlers._last_decision[100], "Test Cafe")
+        self.assertEqual(handlers._last_negotiation_id[100], 1)  # the mocked start_negotiation_log return value
+
+    async def test_a_fresh_unrelated_choir_does_not_touch_prior_calendar_events(self):
+        # Only an explicit /choir update should ever trigger calendar
+        # replacement — a brand new, unrelated /choir must not clean up a
+        # previous plan's events just because one exists for the chat.
+        with patch("choir.bot.handlers.delete_events_for_negotiation") as mock_delete:
+            message = make_message(chat_id=100, text="/choir plan lunch")
+            await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
+            reply_message = make_message(chat_id=100, text="skip")
+            await handlers.handle_occasion_reply(make_update(reply_message), None)
+
+        mock_delete.assert_not_called()
+
+    async def test_final_round_stances_update_each_persons_preference_confidence(self):
+        from choir.schemas import AgentSignal
+        self.mock_run.return_value = NegotiationResult(
+            converged=True, decision="Test Cafe", explanation="works", tradeoffs=["fine"],
+            rounds=[[AgentSignal(user_id=1, stance="COUNTER", reason="r1")],
+                    [AgentSignal(user_id=1, stance="ACCEPT", reason="r2")]],
+        )
+        with patch("choir.bot.handlers.update_preference_confidence") as mock_update:
+            message = make_message(chat_id=100, text="/choir plan lunch")
+            await handlers.handle_choir_command(make_update(message), make_context(["plan", "lunch"]))
+            reply_message = make_message(chat_id=100, text="skip")
+            await handlers.handle_occasion_reply(make_update(reply_message), None)
+
+        mock_update.assert_called_once_with(1, True)
 
     async def test_concurrency_guard_blocks_a_second_choir(self):
         handlers._active_negotiations.add(300)

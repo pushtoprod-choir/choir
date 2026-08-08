@@ -14,6 +14,11 @@ class UserProfile:
     notes: Optional[str] = None   # free-text "anything else we should know" answer from onboarding
     calendar_busy_text: Optional[str] = None  # populated at runtime by choir.calendar.client, never persisted —
                                                # None means "not connected", not "free"
+    preference_confidence: dict = field(default_factory=dict)  # tag -> 0.0-1.0, persisted; a tag missing from
+                                               # this dict (e.g. never negotiated over yet) implies the default
+                                               # starting confidence (see choir.store.profiles.DEFAULT_CONFIDENCE),
+                                               # not zero — callers must not assume every stated preference has
+                                               # an entry here
 
 
 @dataclass
@@ -85,3 +90,7 @@ class CalendarCreationSummary:
     connected: int
     created: int
     extraction_failed: bool = False
+    event_ids: dict = field(default_factory=dict)  # telegram_user_id -> Google Calendar event id, for the ones
+                                                     # actually created — lets the caller persist them so a later
+                                                     # /choir update can delete exactly these events instead of
+                                                     # stacking a duplicate on top

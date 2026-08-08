@@ -10,11 +10,12 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 
-from choir.calendar.client import create_event
+from choir.calendar.client import create_event, delete_event
 from choir.calendar.oauth import get_valid_access_token
 from choir.engine.agent import MODEL, client
 from choir.schemas import CalendarCreationSummary, EventDetails, UserProfile
 from choir.store.calendar_tokens import is_calendar_connected
+from choir.store.profiles import delete_calendar_event_records, get_calendar_events
 
 DEFAULT_DURATION_MINUTES = 90
 
@@ -113,9 +114,34 @@ def create_events_for_connected(
         return CalendarCreationSummary(connected=len(connected), created=0, extraction_failed=True)
 
     created = 0
+    event_ids: dict[int, str] = {}
     for profile in connected:
         access_token = get_valid_access_token(profile.telegram_user_id)
-        if access_token is not None and create_event(access_token, details):
+        if access_token is None:
+            continue
+        event_id = create_event(access_token, details)
+        if event_id:
             created += 1
+            event_ids[profile.telegram_user_id] = event_id
 
-    return CalendarCreationSummary(connected=len(connected), created=created, extraction_failed=False)
+    return CalendarCreationSummary(
+        connected=len(connected), created=created, extraction_failed=False, event_ids=event_ids
+    )
+
+
+def delete_events_for_negotiation(negotiation_id: int) -> None:
+    """Cleans up whatever real calendar events a previous negotiation
+    created, before a /choir update creates new ones for the revised
+    decision — without this, revising a plan just keeps stacking a fresh
+    event on top of the stale one instead of replacing it. Best-effort and
+    silent on any failure per-person (expired token, already-deleted event,
+    network hiccup): a cleanup miss here is not worth blocking or failing
+    the new negotiation's own calendar creation over."""
+    event_ids = get_calendar_events(negotiation_id)
+    if not event_ids:
+        return
+    for telegram_user_id, event_id in event_ids.items():
+        access_token = get_valid_access_token(telegram_user_id)
+        if access_token is not None:
+            delete_event(access_token, event_id)
+    delete_calendar_event_records(negotiation_id)

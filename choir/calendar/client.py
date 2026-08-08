@@ -77,7 +77,7 @@ def attach_calendar_availability(profiles: list[UserProfile]) -> None:
         profile.calendar_busy_text = fetch_busy_summary(profile.telegram_user_id)
 
 
-def create_event(access_token: str, details: EventDetails) -> bool:
+def create_event(access_token: str, details: EventDetails) -> str | None:
     start = datetime.fromisoformat(details.start_iso)
     if start.tzinfo is None:
         start = start.replace(tzinfo=_local_tz())
@@ -98,6 +98,26 @@ def create_event(access_token: str, details: EventDetails) -> bool:
             EVENTS_URL,
             headers={"Authorization": f"Bearer {access_token}"},
             json=body,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        # Returning the real event id (not just True/False) is what lets a
+        # later /choir update find and delete exactly this event instead of
+        # stacking a duplicate on top of a plan that's since changed.
+        return response.json().get("id")
+    except requests.RequestException:
+        return None
+
+
+def delete_event(access_token: str, event_id: str) -> bool:
+    """Best-effort cleanup for choir.calendar.scheduling.delete_events_for_negotiation
+    — an already-deleted or otherwise-404 event, an expired token, or any
+    network error are all the same "nothing more to do here" outcome, never
+    something worth surfacing as an error to the group."""
+    try:
+        response = requests.delete(
+            f"{EVENTS_URL}/{event_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
