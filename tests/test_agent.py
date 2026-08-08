@@ -14,7 +14,7 @@ from unittest.mock import patch
 import anthropic
 import httpx
 
-from choir.engine.agent import _build_response_schema, get_agent_response
+from choir.engine.agent import _build_response_schema, get_agent_response, get_missing_info_question
 from choir.schemas import AgentSignal, UserProfile, VenueResult
 
 PROFILE = UserProfile(telegram_user_id=1, budget_min=100, budget_max=500, preferences=["foodie"], area="HSR")
@@ -169,6 +169,72 @@ class TestGetAgentResponse(unittest.TestCase):
         self.assertIn("No time has been proposed yet", system_prompt)
 
 
+class TestAllContextSourcesCombined(unittest.TestCase):
+    """Every other test in this file exercises one context source at a time
+    (candidates alone, other_signals alone, etc.). This is the "everything is
+    on" shape a real negotiation actually has: occasion text folded into
+    goal_text, a dynamic-question answer sitting in temporary_context, a
+    calendar conflict, last round's signals from everyone else, and real
+    venue candidates, all at once. Each context source is just an independent
+    f-string block concatenated into one prompt, so this is mainly a
+    regression guard against one block accidentally clobbering another
+    (e.g. a stray brace) rather than a test of any new logic."""
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_every_context_source_reaches_the_prompt_without_clobbering_the_others(self, mock_create):
+        mock_create.return_value = text_response(
+            {"stance": "COUNTER", "reason": "considering everything", "counter_proposal": "Cafe A", "proposed_time": "19:00"}
+        )
+        profile = UserProfile(
+            telegram_user_id=1, budget_min=300, budget_max=900,
+            preferences=["foodie"], area="HSR", dietary_notes="vegetarian",
+            temporary_context="need to be back home by 9pm",  # dynamic-question answer
+            notes="usually free on weekends",
+            calendar_busy_text="Team sync (6:00 PM-7:00 PM)",  # attach_calendar_availability
+        )
+        other_signals = [
+            AgentSignal(user_id=2, stance="COUNTER", reason="too far east", counter_proposal="Cafe B", proposed_time="20:00"),
+        ]
+        candidates = [
+            VenueResult(name="Cafe A", address="HSR", rating=0, price_level=0),
+            VenueResult(name="Cafe B", address="Indiranagar", rating=0, price_level=0),
+        ]
+        goal_text = "plan dinner for us tonight (occasion: birthday)"
+
+        signal = get_agent_response(
+            profile, goal_text, PLAN_DATE, "Cafe B", "20:00", round_num=1, max_rounds=4,
+            candidates=candidates, other_signals=other_signals,
+        )
+
+        # The function itself still behaves normally with everything active.
+        self.assertEqual(signal.stance, "COUNTER")
+        self.assertEqual(signal.counter_proposal, "Cafe A")
+        self.assertEqual(signal.proposed_time, "19:00")
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        user_message = mock_create.call_args.kwargs["messages"][0]["content"]
+
+        # Every context source actually made it into the request, none
+        # silently dropped by another block's string formatting.
+        self.assertIn("need to be back home by 9pm", system_prompt)  # temporary_context
+        self.assertIn("Team sync (6:00 PM-7:00 PM)", system_prompt)  # calendar_busy_text
+        self.assertIn("vegetarian", system_prompt)  # dietary_notes
+        self.assertIn("usually free on weekends", system_prompt)  # notes
+        self.assertIn("too far east", system_prompt)  # other_signals
+        self.assertIn("Cafe B", system_prompt)  # counter_proposal from other_signals + a candidate name
+        self.assertIn("Cafe A", system_prompt)  # candidate venue name
+        self.assertIn(PLAN_DATE, system_prompt)  # fixed plan_date
+        self.assertIn("Current proposed time on the table: 20:00", system_prompt)  # current_time
+        self.assertIn("birthday", user_message)  # occasion text, folded into goal_text
+
+        # Venue-grounding is still structurally enforced even with every
+        # other block also present.
+        sent_schema = mock_create.call_args.kwargs["output_config"]["format"]["schema"]
+        self.assertEqual(
+            set(sent_schema["properties"]["counter_proposal"]["enum"]), {"Cafe A", "Cafe B", None}
+        )
+
+
 class TestBuildResponseSchema(unittest.TestCase):
     def test_no_candidates_falls_back_to_free_text(self):
         schema = _build_response_schema([])
@@ -182,6 +248,65 @@ class TestBuildResponseSchema(unittest.TestCase):
         schema = _build_response_schema(["Cafe A"])
         self.assertIn("proposed_time", schema["required"])
         self.assertEqual(schema["properties"]["proposed_time"], {"type": "string"})
+
+
+class TestGetMissingInfoQuestion(unittest.TestCase):
+    """Offline tests for the dynamic-questions classifier (MVP: pre-round
+    only, no mid-round follow-ups). Mocks choir.engine.agent.client the same
+    way TestGetAgentResponse does — this function shares that client/model
+    but is otherwise fully independent of get_agent_response and never
+    touches the ACCEPT/REJECT/COUNTER stance contract."""
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_flags_a_question_when_something_plan_specific_is_missing(self, mock_create):
+        mock_create.return_value = text_response(
+            {"needs_question": True, "question": "Any time window that works best tomorrow?"}
+        )
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertEqual(question, "Any time window that works best tomorrow?")
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_returns_none_when_profile_already_covers_everything(self, mock_create):
+        mock_create.return_value = text_response({"needs_question": False, "question": None})
+        question = get_missing_info_question(PROFILE, "usual lunch spot, nothing fancy")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_api_error_falls_back_to_none_instead_of_raising(self, mock_create):
+        mock_create.side_effect = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com")
+        )
+
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_malformed_json_falls_back_to_none_instead_of_raising(self, mock_create):
+        mock_create.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="not valid json at all")]
+        )
+
+        question = get_missing_info_question(PROFILE, "plan lunch for us tomorrow")
+
+        self.assertIsNone(question)
+
+    @patch("choir.engine.agent.client.messages.create")
+    def test_prompt_lists_every_known_profile_field_to_avoid_duplication(self, mock_create):
+        mock_create.return_value = text_response({"needs_question": False, "question": None})
+        profile = UserProfile(
+            telegram_user_id=1, budget_min=300, budget_max=900,
+            preferences=["foodie", "cafe_person"], area="Koramangala",
+            dietary_notes="vegetarian", notes="usually free on weekends",
+        )
+
+        get_missing_info_question(profile, "plan lunch for us tomorrow")
+
+        system_prompt = mock_create.call_args.kwargs["system"]
+        for known_fact in ("300-900", "foodie", "cafe_person", "Koramangala", "vegetarian", "usually free on weekends"):
+            self.assertIn(known_fact, system_prompt)
 
 
 if __name__ == "__main__":

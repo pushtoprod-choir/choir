@@ -24,6 +24,7 @@ def make_message(chat_id: int, text: str = "", user_id: int = 1, is_bot: bool = 
         from_user=SimpleNamespace(id=user_id, first_name="Test", is_bot=is_bot),
         text=text,
         reply_text=AsyncMock(),
+        get_bot=lambda: SimpleNamespace(send_message=AsyncMock()),
     )
 
 
@@ -85,6 +86,14 @@ class TestOccasionAndTripFlow(unittest.IsolatedAsyncioTestCase):
         extract_date_patch = patch("choir.bot.handlers.extract_plan_date", return_value=PLAN_DATE)
         self.mock_extract_date = extract_date_patch.start()
         self.addCleanup(extract_date_patch.stop)
+
+        # get_missing_info_question hits the Anthropic API for real — mocked
+        # to None (no question needed) by default so _gather_dynamic_context
+        # is a no-op and doesn't need message.get_bot() in these tests. Kept
+        # as its own attribute so tests can assert whether it was called.
+        missing_info_patch = patch("choir.bot.handlers.get_missing_info_question", return_value=None)
+        self.mock_get_missing_info = missing_info_patch.start()
+        self.addCleanup(missing_info_patch.stop)
 
         run_patch = patch("choir.bot.handlers.run_negotiation")
         self.mock_run = run_patch.start()
@@ -199,6 +208,28 @@ class TestOccasionAndTripFlow(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(100, handlers._pending_occasion)
         self.assertIn("what date", message.reply_text.call_args[0][0].lower())
 
+    async def test_run_negotiation_gathers_dynamic_context_by_default(self):
+        # "/choir update" (the old bypass path) no longer exists as a
+        # recognized command, so every negotiation now goes through
+        # _gather_dynamic_context unless a caller explicitly opts out via
+        # skip_dynamic_questions.
+        self.mock_get_missing_info.return_value = None
+        message = make_message(chat_id=100, text="/choir plan lunch")
+        await handlers._run_negotiation(message, "plan lunch", PLAN_DATE)
+
+        self.mock_get_missing_info.assert_called()
+
+    async def test_run_negotiation_can_skip_dynamic_context(self):
+        # skip_dynamic_questions is still an available _run_negotiation
+        # parameter even with no current caller setting it True — this
+        # verifies the bypass mechanism itself still works.
+        self.mock_get_missing_info.return_value = "Would a real question ever be asked here?"
+        message = make_message(chat_id=100, text="/choir plan lunch")
+        await handlers._run_negotiation(message, "plan lunch", PLAN_DATE, skip_dynamic_questions=True)
+
+        self.mock_get_missing_info.assert_not_called()
+        self.mock_run.assert_called_once()
+
     async def test_start_trip_creates_a_trip_and_blocks_a_second_start(self):
         with patch("choir.bot.handlers.get_active_trip", return_value=None), \
              patch("choir.bot.handlers.start_trip", return_value=5) as mock_start_trip:
@@ -312,6 +343,8 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.finish_negotiation_log"),
             patch("choir.bot.handlers.get_active_trip", return_value=None),
             patch("choir.bot.handlers.attach_calendar_availability"),
+            patch("choir.bot.handlers.get_missing_info_question", return_value=None),
+            patch("choir.bot.handlers._send_ride_suggestions"),
         ]
         for p in self.patches:
             p.start()

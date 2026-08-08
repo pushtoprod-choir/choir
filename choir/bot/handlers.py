@@ -25,9 +25,11 @@ from choir.store.profiles import (
     get_trip_negotiations,
 )
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
+from choir.engine.agent import get_missing_info_question
 from choir.engine.orchestrator import format_transcript, run_negotiation
-from choir.venues.places import build_venue_query, find_venues
+from choir.venues.places import build_venue_query, find_venues, geocode_areas, haversine_distance_km
 from choir.venues.enrichment import enrich_venues
+from choir.actions.links import build_ride_deeplink, describe_ride_suggestion, find_carpool_pairs
 from choir.bot.intent import is_planning_request
 from choir.bot.date_extraction import extract_plan_date
 from choir.calendar.client import attach_calendar_availability
@@ -54,6 +56,18 @@ class _PendingPlan:
 _pending_occasion: dict[int, _PendingPlan] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
+
+# user_id -> (chat_id, future) for an outstanding dynamic-question DM. Keyed
+# by user_id (not chat_id) since this is a private DM, not a group flow, and
+# is the first per-user (rather than per-chat) pending state in this file —
+# see _gather_dynamic_context for how a collision (same person flagged by two
+# concurrent negotiations) is handled.
+_pending_clarifications: dict[int, tuple[int, "asyncio.Future"]] = {}
+
+# Long enough to glance at a phone and reply, short enough that the group
+# doesn't feel like /choir hung. This is optional enrichment, not a hard
+# gate — a timeout just means proceeding without that person's answer.
+_CLARIFICATION_TIMEOUT_SECONDS = 45
 
 # Telegram's hard cap is 4096 chars; leave headroom below it since Markdown
 # entities and the surrounding reply text add to the same budget — this
@@ -180,6 +194,49 @@ def _format_plan_datetime(plan_date: str, decided_time: str) -> str:
     return f"{date_part} at {time_part}"
 
 
+async def _send_ride_suggestions(chat_id: int, profiles: list[UserProfile], venue: VenueResult, bot) -> None:
+    """Best-effort, DM-only ride-suggestion stub — not a real booking, just a
+    pre-filled Uber deep link plus a distance-based carpool nudge, sent
+    privately (pickup area is personal, same reasoning as budget). Skips
+    entirely if LocationIQ isn't configured or the venue has no real
+    coordinates; a failed DM to one person never blocks another's."""
+    location_iq_key = os.environ.get("LOCATION_IQ_API_KEY")
+    if not location_iq_key or not (venue.lat and venue.lon):
+        return
+
+    areas = list({p.area for p in profiles})
+    area_coords = await asyncio.to_thread(geocode_areas, areas, location_iq_key)
+    dropoff = (venue.lat, venue.lon)
+
+    user_coords: dict[int, tuple[float, float]] = {}
+    for profile in profiles:
+        pickup = area_coords.get(profile.area)
+        if pickup is None:
+            continue
+        user_coords[profile.telegram_user_id] = pickup
+
+        distance = haversine_distance_km(pickup, dropoff)
+        text = describe_ride_suggestion(distance, build_ride_deeplink(pickup, dropoff))
+        if not text:
+            continue
+        try:
+            await bot.send_message(chat_id=profile.telegram_user_id, text=text)
+        except Exception:
+            logging.exception("Failed to DM ride suggestion to user %s", profile.telegram_user_id)
+
+    for user_a, user_b, _distance in find_carpool_pairs(user_coords):
+        name_a = get_member_name(chat_id, user_a)
+        name_b = get_member_name(chat_id, user_b)
+        for this_user, other_name in ((user_a, name_b), (user_b, name_a)):
+            try:
+                await bot.send_message(
+                    chat_id=this_user,
+                    text=f"🚗 You and {other_name} are both nearby — might be worth sharing a ride tonight.",
+                )
+            except Exception:
+                logging.exception("Failed to DM carpool suggestion to user %s", this_user)
+
+
 def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
     member_ids = get_seen_members(chat_id)
     profiles = []
@@ -191,6 +248,97 @@ def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
         else:
             profiles.append(profile)
     return profiles, missing_users
+
+
+async def _gather_dynamic_context(message, profiles: list[UserProfile], goal_text: str) -> None:
+    """Pre-round-1 dynamic-questions phase (MVP: pre-round only, no mid-round
+    follow-ups, no changes to orchestrator.py's round loop or the
+    ACCEPT/REJECT/COUNTER contract). For each profile, asks its agent whether
+    this specific request is missing something onboarding didn't cover; DMs
+    whoever needs one, waits (bounded by _CLARIFICATION_TIMEOUT_SECONDS) for
+    replies, and folds answers into that profile's temporary_context IN
+    PLACE — same runtime-only, never-persisted pattern as
+    attach_calendar_availability populating calendar_busy_text. Best-effort:
+    a failed DM, a skip, or a timeout all just mean proceeding without that
+    person's answer, never blocking or crashing the negotiation."""
+    questions = await asyncio.gather(
+        *(asyncio.to_thread(get_missing_info_question, p, goal_text) for p in profiles)
+    )
+    flagged = [(p, q) for p, q in zip(profiles, questions) if q]
+    if not flagged:
+        return
+
+    loop = asyncio.get_event_loop()
+    bot = message.get_bot()
+    futures: dict[int, "asyncio.Future"] = {}
+
+    for profile, question in flagged:
+        user_id = profile.telegram_user_id
+        if user_id in _pending_clarifications:
+            # Already waiting on a clarification for this same person from a
+            # different concurrent negotiation (a different group) — fail
+            # open rather than clobber the other one's pending state or ask
+            # this person two questions from two bots-in-their-DMs at once.
+            continue
+        future = loop.create_future()
+        _pending_clarifications[user_id] = (message.chat_id, future)
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"Quick one before I negotiate on your behalf: {question}\n"
+                '(or reply "skip")',
+            )
+            futures[user_id] = future
+        except Exception:
+            logging.exception("Failed to DM clarifying question to user %s", user_id)
+            _pending_clarifications.pop(user_id, None)
+
+    if not futures:
+        return
+
+    done, _pending = await asyncio.wait(
+        futures.values(), timeout=_CLARIFICATION_TIMEOUT_SECONDS
+    )
+
+    for user_id, future in futures.items():
+        _pending_clarifications.pop(user_id, None)
+        if future in done:
+            answer = future.result()
+            if answer:
+                for profile in profiles:
+                    if profile.telegram_user_id == user_id:
+                        profile.temporary_context = answer
+                        break
+        else:
+            future.cancel()
+
+
+async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the plain-text DM reply to a dynamic clarifying question. A
+    no-op for every message except one from a user with an outstanding
+    clarification — mirrors handle_occasion_reply's shape, but keyed by
+    user_id (a DM) instead of chat_id (a group)."""
+    message = update.message
+    if (
+        message is None
+        or message.from_user is None
+        or message.from_user.is_bot
+        or not message.text
+    ):
+        return
+
+    user_id = message.from_user.id
+    pending = _pending_clarifications.get(user_id)
+    if pending is None:
+        return
+
+    _, future = pending
+    if future.done():
+        return
+
+    answer = message.text.strip()
+    future.set_result(None if answer.lower() in _SKIP_WORDS else answer)
+    await message.reply_text("Got it, thanks!")
 
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -409,7 +557,9 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
     await _run_negotiation(message, goal_text, pending.plan_date)
 
 
-async def _run_negotiation(message, goal_text: str, plan_date: str):
+async def _run_negotiation(
+    message, goal_text: str, plan_date: str, skip_dynamic_questions: bool = False
+):
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -425,6 +575,13 @@ async def _run_negotiation(message, goal_text: str, plan_date: str):
     # None (its default) for anyone not connected or on any lookup failure,
     # so this is a no-op for groups where nobody's connected their calendar.
     await asyncio.to_thread(attach_calendar_availability, profiles)
+
+    # skip_dynamic_questions=True for "/choir update <reason>": an explicit
+    # revision command doesn't need re-clarifying — the reason for changing
+    # already provides fresh context, same rationale as skipping the
+    # occasion question and intent-gating on that path.
+    if not skip_dynamic_questions:
+        await _gather_dynamic_context(message, profiles, goal_text)
 
     request = NegotiationRequest(
         group_chat_id=message.chat_id,
@@ -533,6 +690,11 @@ async def _run_negotiation(message, goal_text: str, plan_date: str):
                 "Failed to send decision message; retrying without venues"
             )
             await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+        if result.decided_venue:
+            # Trailing, best-effort step — runs after the main decision
+            # message so a failure here can never affect or delay it.
+            await _send_ride_suggestions(message.chat_id, profiles, result.decided_venue, message.get_bot())
     else:
         options_text = "\n".join(f"• {opt}" for opt in result.top_options)
         base = f"🤔 *Couldn't fully agree — here are the top options:*\n{options_text}"
