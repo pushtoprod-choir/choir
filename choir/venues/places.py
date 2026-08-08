@@ -6,6 +6,7 @@ LOCATION_IQ_API_KEY). LocationIQ has no Google-style ratings or price levels,
 so VenueResult.rating/price_level are always 0 for results from here: showing
 nothing is more honest than inventing a plausible-looking number.
 """
+import math
 from typing import Optional
 
 import requests
@@ -16,6 +17,11 @@ GEOCODE_URL = "https://us1.locationiq.com/v1/search"
 NEARBY_URL = "https://us1.locationiq.com/v1/nearby"
 SEARCH_RADIUS_METERS = 2000
 REQUEST_TIMEOUT_SECONDS = 10
+EARTH_RADIUS_KM = 6371.0
+# handlers.py's venue display now has its own length guard (_build_venues_text),
+# so this can be tuned up from LocationIQ's smaller default without risking an
+# over-length Telegram message.
+NEARBY_RESULTS_LIMIT = 8
 
 # purpose -> LocationIQ nearby "tag" filter. Simplest working version, same
 # spirit as the keyword_map in plan.md's Phase 5 sketch.
@@ -41,6 +47,15 @@ PURPOSE_KEYWORDS = {
 
 
 def detect_purpose(goal_text: str) -> str:
+    """Keyword-spots the /choir goal text for purpose.
+
+    This is also, deliberately, occasion-aware: choir/bot/handlers.py's
+    occasion-capture flow appends the answer straight onto goal_text
+    ("...(occasion: work catchup)") before it ever reaches this function, so
+    "work catchup" or "birthday drinks" already steer purpose detection
+    correctly with no extra plumbing — see tests/test_places.py's
+    TestDetectPurpose.test_occasion_text_appended_by_handlers_influences_purpose
+    for the regression test locking this in."""
     lowered = goal_text.lower()
     for purpose, keywords in PURPOSE_KEYWORDS.items():
         if any(keyword in lowered for keyword in keywords):
@@ -75,15 +90,40 @@ def _geocode(area: str, api_key: str) -> Optional[tuple[float, float]]:
     return float(results[0]["lat"]), float(results[0]["lon"])
 
 
-def find_venues(query: VenueQuery, api_key: str) -> list[VenueResult]:
-    """Geocodes every stated area, averages the coordinates as a rough
+def geocode_areas(areas: list[str], api_key: str) -> dict[str, Optional[tuple[float, float]]]:
+    """Geocodes each area once. find_venues() (search midpoint) and the
+    orchestrator's per-person distance verification both need real
+    coordinates for the same areas — sharing this means a negotiation
+    geocodes each area exactly once, not twice."""
+    return {area: _geocode(area, api_key) for area in areas}
+
+
+def haversine_distance_km(coord1: tuple[float, float], coord2: tuple[float, float]) -> float:
+    """Real great-circle distance between two (lat, lon) points — used as a
+    deterministic hard constraint, not an approximation for display."""
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
+
+
+def find_venues(
+    query: VenueQuery, api_key: str, area_coords: Optional[dict[str, Optional[tuple[float, float]]]] = None
+) -> list[VenueResult]:
+    """Geocodes every stated area (or reuses area_coords if the caller
+    already has it — see geocode_areas), averages the coordinates as a rough
     midpoint (good enough for a hackathon — same approach as the original
     Google Places sketch in plan.md), then searches LocationIQ's nearby-POI
     endpoint around that point for the tag matching the meetup's purpose.
     Fails soft (returns []) on any lookup problem — venue suggestions are a
     bonus on top of the negotiated decision, not something worth crashing
     the whole /choir command over."""
-    coords = [c for c in (_geocode(area, api_key) for area in query.areas) if c is not None]
+    if area_coords is None:
+        area_coords = geocode_areas(query.areas, api_key)
+    coords = [c for c in area_coords.values() if c is not None]
     if not coords:
         return []
 
@@ -99,7 +139,7 @@ def find_venues(query: VenueQuery, api_key: str) -> list[VenueResult]:
                 "lon": midpoint_lon,
                 "tag": PURPOSE_TAGS.get(query.purpose, PURPOSE_TAGS[DEFAULT_PURPOSE]),
                 "radius": SEARCH_RADIUS_METERS,
-                "limit": 5,
+                "limit": NEARBY_RESULTS_LIMIT,
                 "dedupe": 1,
                 "format": "json",
             },

@@ -1,0 +1,71 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Choir is a Telegram bot where every group member gets a private AI representative that negotiates group decisions (starting with outings) on their behalf, using a stored profile (budget, preferences, area, dietary needs) so nobody has to state real constraints out loud in the group. Built for Push to Prod (Anthropic & Elevation Capital), Bengaluru.
+
+## Commands
+
+### Setup
+```bash
+python3 -m venv choir-env
+choir-env\Scripts\activate      # Windows; source choir-env/bin/activate on Unix
+pip install -r requirements.txt
+```
+Copy `.env.example` to `.env` and fill in `TELEGRAM_BOT_TOKEN`, `ANTHROPIC_API_KEY`, `LOCATION_IQ_API_KEY`. Google Calendar integration additionally needs `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI`, `OAUTH_CALLBACK_PORT`, `CHOIR_TIMEZONE` — the bot still runs fine without these, just with calendar features silently no-op'd (see "Calendar integration" below).
+
+### Run the bot
+```bash
+python main.py
+```
+Long-polling — no public server/webhook needed. Must be restarted after any code change to pick it up (it's a long-running process, not hot-reloaded).
+
+### Tests
+Two different kinds of "test" files exist side by side — know which one you're running:
+
+- **`tests/` — offline, mocked, no API keys needed.** These are what `pytest` actually collects (root-level `test_engine.py`/`test_venues.py` define no `test_*`-prefixed functions, so pytest skips them even though the filenames match the discovery pattern).
+  ```bash
+  pytest -q                                          # full offline suite
+  pytest tests/test_orchestrator.py -q                # one file
+  pytest tests/test_orchestrator.py -k test_converges_after_a_counter_is_accepted   # one test
+  # or: python -m unittest tests.test_orchestrator -v
+  ```
+- **Root-level `test_engine.py` / `test_venues.py` — live manual scripts, hit real APIs.** Run directly with `python test_engine.py` / `python test_venues.py`; they need real keys in `.env` and are the "does this actually work end-to-end" check, not part of CI-style runs.
+
+## Architecture
+
+### Request flow
+`/choir <goal text>` in a group → `choir/bot/handlers.py:handle_choir_command`:
+1. An `update.update_id` dedup guard (`_already_processed`, a bounded FIFO) drops Telegram long-poll redeliveries before anything else runs — without it a redelivered `/choir` would trigger a second full negotiation for a trigger already handled.
+2. Every group member seen so far (`get_seen_members`, populated by `track_group_member` on every group message) must have a saved profile, or the command bails out and tells them to DM the bot.
+3. `args[0] == "update"` branches into the **update path**: it resolves the previous decision (in-memory `_last_decision`, falling back to the persisted `negotiations` log if the process restarted), requires a reason, seeds `goal_text` with both, and skips straight to `_run_negotiation` — **bypassing both the occasion question and intent-gating below**, since an explicit revision command doesn't need classifying and a reason like "someone's running late" would plausibly fail a naive planning-intent check anyway.
+4. Otherwise, a cheap intent-classification call (`choir/bot/intent.py`) gates out non-planning messages (e.g. "what's up") before asking the occasion question — fails **open** (treats it as a real request) if the classifier call itself fails, so a flaky call never silently swallows a genuine ask. On a pass, the bot asks "what's the occasion?" (`_pending_occasion`) and `handle_occasion_reply` picks up the answer (or "skip") before calling `_run_negotiation` — occasion text is appended to `goal_text` and deliberately steers `choir/venues/places.py:detect_purpose` (e.g. "birthday drinks" → the `drinks` tag).
+5. `_run_negotiation` calls `attach_calendar_availability` (best-effort; a no-op for groups where nobody's calendar-connected) before building the `NegotiationRequest`, opens an append-only audit-log row (`start_negotiation_log`), then drives `choir/engine/orchestrator.py:run_negotiation` for up to `MAX_ROUNDS_CAP` rounds, calling `choir/engine/agent.py:get_agent_response` once per person per round (parallelized across a `ThreadPoolExecutor`). Each round's signals are persisted (`record_negotiation_round`) as they complete — a crash mid-negotiation still leaves a real record — and `sync_on_round` bridges the sync orchestrator back to the async `on_round` callback that posts live per-round updates to the group.
+6. On convergence, if the decision resolved to a real, negotiated-over LocationIQ candidate (`result.decided_venue` — see "Venue grounding" below), `_describe_decided_venue` enriches just that one venue. Otherwise (ungrounded free-text decision, or non-convergence), `_fallback_venue_suggestions` runs a fresh `find_venues` + `enrich_venues` search and renders it through `_build_venues_text`, which truncates trailing venues to fit a computed character budget so the combined reply can never exceed Telegram's 4096-char cap. Every outgoing `reply_text` call is additionally wrapped in `try/except`, retrying without the venue text on failure as a last-resort safety net.
+7. On convergence, `create_events_for_connected` (best-effort; `None` if nobody's calendar-connected) turns the decision into a concrete event via one structured Claude call and creates it on every connected participant's calendar, appending a one-line summary to the reply.
+8. `finish_negotiation_log` closes out the audit-log row, and `format_transcript` (in `orchestrator.py`) renders the full round-by-round history as a follow-up message; both this and the live round updates resolve Telegram display names through the same `choir.store.profiles.get_member_name` (injected into `format_transcript` via an optional `resolve_name` callback, so the engine module itself stays DB-free).
+
+### Venue grounding and hard constraints
+`choir/engine/orchestrator.py:_fetch_venue_context` geocodes every profile's area once (`choir/venues/places.py:geocode_areas`) and fetches real nearby LocationIQ candidates before the round loop starts. `choir/engine/agent.py:_build_response_schema` then constrains each agent's `counter_proposal` to an `enum` of those exact venue names when candidates exist — the model is *structurally* unable to invent a venue, not just asked nicely not to. On a unanimous ACCEPT, `_verify_decision` runs a deterministic haversine-distance check (no LLM call) between the agreed venue and every profile's geocoded area; a violation overrides the "converged" result even after everyone accepted, falling through to the same honest non-convergence path as running out of rounds. This is the one hard constraint enforced in code — the calendar-conflict check in `agent.py`'s prompt, by contrast, is enforced by the LLM only.
+
+### Persistence and concurrency
+`choir/store/profiles.py` uses `PRAGMA journal_mode=WAL` plus a 10s busy-timeout connect (`_connect()`, also used by `choir/store/calendar_tokens.py`) so concurrent negotiation-round writes don't lock out other readers/writers. The `negotiations`/`negotiation_rounds` tables are an **append-only audit trail, not a resume mechanism** — a crash mid-negotiation leaves an inspectable record, but doesn't make an interrupted negotiation continue from where it left off.
+
+### The engine/bot boundary
+`choir/engine/` (agent.py, orchestrator.py) has **zero Telegram/SQLite knowledge** — it's pure `(profiles, goal text) -> NegotiationResult`, and `run_negotiation`'s `on_round` callback signature is treated as a stable contract the bot layer depends on. `choir/schemas.py` is the load-bearing shared-contract file — every dataclass there (`UserProfile`, `AgentSignal`, `VenueResult`, etc.) is read by multiple modules across the engine/bot/store/venues boundary, so changes there ripple widely; prefer adding optional fields over changing existing ones. Module docstrings still reference the original hackathon phase split (`agent.py`/`orchestrator.py` = "Person A", `places.py` = "Person C") from `plan.md` — that plan is a historical build-order reference, not current state (the engine is fully implemented, not a stub).
+
+### SQLite schema (`choir/store/profiles.py`)
+`choir.db` is git-ignored and has **no migration framework** — `init_db()` is the only schema authority, using `CREATE TABLE IF NOT EXISTS` for new tables (`profiles`, `seen_members`, `negotiations`, `negotiation_rounds`, `calendar_tokens`) and a `try/except sqlite3.OperationalError` around `ALTER TABLE ... ADD COLUMN` for columns added after a table already existed (so it's safe to call against both a fresh DB and an already-populated one). When adding a `UserProfile` field, you need to touch four places in sync: the dataclass in `schemas.py`, the `ALTER TABLE` guard in `init_db()`, the explicit column list in `save_profile`, and the explicit `SELECT` column list + constructor call in `get_profile`. Note `UserProfile.calendar_busy_text` is the one exception — it's populated at runtime by `choir.calendar.client`, never persisted, so it's deliberately absent from all four of those places.
+
+`seen_members` (`chat_id`, `user_id`, `first_name`) is separate from `profiles` (keyed only on `telegram_user_id`) — it's how the bot knows who's present in which group (to require profiles for) and resolves display names. `first_name` updates are **broadcast across every chat_id row for that user_id** (not scoped to the chat_id in the call), since a person's name doesn't vary per group — this is what lets a name learned in one group (or during onboarding, which only has a DM chat_id) backfill stale `NULL` rows elsewhere.
+
+### Onboarding state machine
+`choir/bot/onboarding.py` defines a linear `ConversationHandler` flow (`BUDGET → PREFERENCES → AREA → DIETARY → ANYTHING_ELSE`) whose state constants and handler functions are wired into `main.py`'s `ConversationHandler(states={...})` — the two files must stay in sync when adding/removing a step. It only runs in DMs (`filters.ChatType.PRIVATE`) because Telegram bots can't message a user first; group activity (`track_group_member`) is what triggers the "you haven't set up Choir yet" prompt.
+
+### Calendar integration (`choir/calendar/`)
+`oauth.py` handles Google OAuth mechanics (state-token CSRF protection with a TTL and pop-once replay prevention, `prompt=consent` to guarantee a refresh token, transparent access-token refresh); `client.py` reads/writes events via the Calendar REST API directly with `requests` (same no-SDK approach as `choir/venues/places.py` takes with LocationIQ); `scheduling.py` turns a negotiated decision into concrete event fields via one structured Claude call (reusing `choir.engine.agent`'s client, not a second one) and creates the event on every connected participant's calendar. `choir/calendar/server.py` serves the OAuth callback as a tiny `aiohttp` app sharing `main.py`'s asyncio event loop with PTB's polling. Every calendar operation fails soft — a missing connection, an expired/revoked token, or any network error all collapse to the same "not connected" behavior, never a crash or a blocked `/choir` reply.
+
+### Import-order gotcha
+`choir/engine/agent.py`, `choir/venues/enrichment.py`, and `choir/bot/intent.py` all construct an `Anthropic()` client **at module import time**, so `load_dotenv()` must run before any `choir.*` import — `main.py` and the root-level manual test scripts do this explicitly as the first lines, with a comment explaining why. A standalone script or REPL session that imports `choir.*` before loading env vars will fail non-obviously (or, for the intent classifier and enrichment paths specifically, silently fail *open*/*closed* rather than crash — see their module docstrings).

@@ -34,6 +34,15 @@ class TestDetectPurpose(unittest.TestCase):
     def test_defaults_to_casual_lunch(self):
         self.assertEqual(detect_purpose("plan something for us"), "casual_lunch")
 
+    def test_occasion_text_appended_by_handlers_influences_purpose(self):
+        # choir/bot/handlers.py's occasion-capture flow appends the answer
+        # straight onto goal_text ("...(occasion: X)") before this function
+        # ever sees it — locking in that this actually steers detection,
+        # not just that it doesn't crash.
+        self.assertEqual(detect_purpose("plan something for us (occasion: work catchup)"), "work_meeting")
+        self.assertEqual(detect_purpose("do something (occasion: birthday drinks)"), "drinks")
+        self.assertEqual(detect_purpose("plan something (occasion: just because)"), "casual_lunch")
+
 
 class TestBuildVenueQuery(unittest.TestCase):
     def test_uses_the_most_constrained_budget(self):
