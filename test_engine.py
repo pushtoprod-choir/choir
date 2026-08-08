@@ -50,6 +50,7 @@ request = NegotiationRequest(
     group_chat_id=0,
     goal_text="plan dinner for us tonight",
     profiles=profiles,
+    plan_date="2026-08-15",
 )
 
 
@@ -59,6 +60,8 @@ def on_round(round_num, signals):
         line = f"  user {s.user_id}: {s.stance} — {s.reason}"
         if s.counter_proposal:
             line += f" (proposes: {s.counter_proposal})"
+        if s.proposed_time:
+            line += f" (time: {s.proposed_time})"
         print(line)
 
 
@@ -68,6 +71,7 @@ if __name__ == "__main__":
     print("\n=== RESULT ===")
     if result.converged:
         print(f"Decision: {result.decision}")
+        print(f"Decided time: {result.decided_time}")
         print(f"Explanation: {result.explanation}")
         print("Tradeoffs:")
         for t in result.tradeoffs:

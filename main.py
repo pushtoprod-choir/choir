@@ -30,7 +30,12 @@ from telegram.ext import (
 
 from choir.store.profiles import init_db
 from choir.bot.calendar_commands import cmd_connect_calendar
-from choir.bot.handlers import handle_choir_command, handle_occasion_reply, track_group_member
+from choir.bot.handlers import (
+    handle_choir_command,
+    handle_clarification_reply,
+    handle_occasion_reply,
+    track_group_member,
+)
 from choir.bot.onboarding import (
     start_onboarding,
     handle_budget,
@@ -75,6 +80,21 @@ async def main():
         fallbacks=[CommandHandler("cancel", cancel_onboarding)],
     )
     app.add_handler(onboarding_handler)
+    # Catches the plain-text DM reply to a dynamic clarifying question.
+    # Registered after onboarding_handler in the same default group (0) so
+    # PTB checks onboarding's ConversationHandler first for any private text
+    # message: while a conversation is active for that chat it claims the
+    # update and this handler never runs, so it can't swallow someone's
+    # onboarding answer. When no conversation is active (the common case),
+    # onboarding's check_update requires the /start command and returns
+    # False for plain text, falling through to this handler — which itself
+    # is a no-op unless that user has an outstanding clarification pending.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_clarification_reply,
+        )
+    )
 
     # PTB's polling and the OAuth callback server share one asyncio event
     # loop, composed by hand via Application's init/start primitives instead

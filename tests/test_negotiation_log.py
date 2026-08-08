@@ -67,6 +67,22 @@ class TestNegotiationLog(unittest.TestCase):
         self.assertEqual(history[0]["decision"], "B")
         self.assertEqual(history[1]["decision"], "A")
 
+    def test_plan_date_and_decided_time_round_trip(self):
+        negotiation_id = profiles.start_negotiation_log(chat_id=100, goal_text="plan lunch", plan_date="2026-08-15")
+        profiles.finish_negotiation_log(negotiation_id, converged=True, decision="Cafe X", decided_time="19:30")
+
+        history = profiles.get_negotiation_history(chat_id=100)
+        self.assertEqual(history[0]["plan_date"], "2026-08-15")
+        self.assertEqual(history[0]["decided_time"], "19:30")
+
+    def test_plan_date_and_decided_time_default_to_none(self):
+        negotiation_id = profiles.start_negotiation_log(chat_id=100, goal_text="plan lunch")
+        profiles.finish_negotiation_log(negotiation_id, converged=False, decision=None)
+
+        history = profiles.get_negotiation_history(chat_id=100)
+        self.assertIsNone(history[0]["plan_date"])
+        self.assertIsNone(history[0]["decided_time"])
+
 
 class TestTrips(unittest.TestCase):
     def setUp(self):
@@ -95,6 +111,17 @@ class TestTrips(unittest.TestCase):
         linked = profiles.get_trip_negotiations(trip_id)
         self.assertEqual(len(linked), 1)
         self.assertEqual(linked[0]["goal_text"], "plan lunch")
+
+    def test_trip_negotiations_include_plan_date_and_decided_time(self):
+        trip_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")
+        negotiation_id = profiles.start_negotiation_log(
+            chat_id=100, goal_text="plan lunch", trip_id=trip_id, plan_date="2026-08-15"
+        )
+        profiles.finish_negotiation_log(negotiation_id, converged=True, decision="Cafe X", decided_time="19:30")
+
+        linked = profiles.get_trip_negotiations(trip_id)
+        self.assertEqual(linked[0]["plan_date"], "2026-08-15")
+        self.assertEqual(linked[0]["decided_time"], "19:30")
 
     def test_end_trip_clears_active_status_and_stores_summary(self):
         trip_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")

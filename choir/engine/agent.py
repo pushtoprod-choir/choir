@@ -7,6 +7,7 @@ the only thing that calls this, once per person per round.
 """
 import json
 import logging
+from datetime import datetime
 
 import anthropic
 from anthropic import Anthropic
@@ -29,6 +30,11 @@ def _build_response_schema(candidate_names: list[str]) -> dict:
     falls back to free text so the negotiation still runs, just ungrounded,
     exactly as it did before venue integration existed.
 
+    proposed_time, unlike counter_proposal, is always a required non-null
+    string — the date is fixed by the user before negotiation ever starts
+    (see NegotiationRequest.plan_date), so the time is the one thing left for
+    every agent to actually decide every round, not just when countering.
+
     This is why we don't hand-parse "ACCEPT: <reason>" strings the way the
     original plan sketch did — a malformed or slightly-off-format model
     reply was the single most likely demo-day crash, and structured outputs
@@ -46,8 +52,9 @@ def _build_response_schema(candidate_names: list[str]) -> dict:
             "stance": {"type": "string", "enum": ["ACCEPT", "REJECT", "COUNTER"]},
             "reason": {"type": "string"},
             "counter_proposal": counter_proposal_schema,
+            "proposed_time": {"type": "string"},
         },
-        "required": ["stance", "reason", "counter_proposal"],
+        "required": ["stance", "reason", "counter_proposal", "proposed_time"],
         "additionalProperties": False,
     }
 
@@ -55,7 +62,9 @@ def _build_response_schema(candidate_names: list[str]) -> dict:
 def get_agent_response(
     profile: UserProfile,
     goal_text: str,
+    plan_date: str,
     current_proposal: str | None,
+    current_time: str | None,
     round_num: int = 0,
     max_rounds: int = 1,
     candidates: list[VenueResult] | None = None,
@@ -89,6 +98,13 @@ def get_agent_response(
     multi-way split at all; this is what lets one agent's reasoning actually
     respond to another's stated conflict instead of just restating its own
     favorite every round.
+
+    plan_date is fixed before negotiation starts (extracted from the /choir
+    plan text) and never up for debate here — the agent only ever negotiates
+    current_time, the same "on the table" / counter pattern current_proposal
+    already uses for the venue, just applied to the clock instead of the
+    place. Every response carries a proposed_time, unlike counter_proposal
+    which is only set while actively countering.
     """
     candidates = candidates or []
     rounds_left = max_rounds - round_num
@@ -105,7 +121,9 @@ def get_agent_response(
 
     if other_signals:
         other_lines = [
-            f"- {s.stance}: {s.reason}" + (f" (wants: {s.counter_proposal})" if s.counter_proposal else "")
+            f"- {s.stance}: {s.reason}"
+            + (f" (wants venue: {s.counter_proposal})" if s.counter_proposal else "")
+            + (f" (wants time: {s.proposed_time})" if s.proposed_time else "")
             for s in other_signals
         ]
         others_block = "\nWhat everyone else in the group said last round:\n" + "\n".join(other_lines) + "\n"
@@ -126,6 +144,15 @@ def get_agent_response(
     else:
         preferences_block = "none stated"
 
+    time_block = (
+        f"\nThe date is fixed and not up for discussion: {plan_date}. "
+        + (
+            f"Current proposed time on the table: {current_time}."
+            if current_time
+            else "No time has been proposed yet — you must propose one."
+        )
+    )
+
     system_prompt = f"""You represent one person in a group negotiation over what the group should do.
 You know only this person's private preferences below. You never see anyone
 else's budget or constraints, and your "reason" is shown to the whole group,
@@ -141,6 +168,7 @@ Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}
 Additional notes: {profile.notes or "none"}
 Calendar (next 48h): {profile.calendar_busy_text or "not connected - no availability data"}
+{time_block}
 {others_block}{venues_block}
 This is round {round_num + 1} of {max_rounds}. If the group still hasn't all
 agreed on the same thing by the end of round {max_rounds}, NOBODY gets a
@@ -167,13 +195,19 @@ Decide your stance on the current proposal:
   middle ground over repeating your own favorite unchanged.
 Otherwise leave "counter_proposal" null.
 
-Also factor in timing. If you have a schedule constraint, say so in your reason.
-If proposing a COUNTER, include a suggested time alongside the place.
+You must always fill in "proposed_time" (24-hour "HH:MM", e.g. "19:30") —
+the date above is fixed, but the time is the one thing that's always yours to
+decide, regardless of stance. If the current proposed time above works for
+you, repeat that same value to confirm it; if it doesn't (a schedule
+conflict, or it's just a bad time for you), put your preferred time instead —
+this is exactly how counter_proposal works for the venue, just applied to the
+clock. If nothing's been proposed yet, pick a reasonable time given the plan.
 
-If the calendar line above shows a real conflict with the current proposal's
-time, treat it like a hard constraint (REJECT or COUNTER with a different
-time) — but never restate the other event's title or details in your reason,
-same rule as never restating your exact budget numbers."""
+If the calendar line above shows a real conflict with the current proposed
+time, treat it like a hard constraint (REJECT the venue, or propose a
+different proposed_time) — but never restate the other event's title or
+details in your reason, same rule as never restating your exact budget
+numbers."""
 
     if current_proposal:
         user_message = f"The group wants to: {goal_text}\nCurrent proposal on the table: {current_proposal}"
@@ -237,7 +271,13 @@ same rule as never restating your exact budget numbers."""
         stance = data["stance"]
         reason = data["reason"]
         counter_proposal = data["counter_proposal"]
-    except (StopIteration, json.JSONDecodeError, KeyError, TypeError):
+        # Validated (not just trusted) the same way start_iso is normalized in
+        # choir/calendar/scheduling.py — the schema constrains the type to a
+        # string but not its format, and a malformed time here would silently
+        # break the deterministic date+time combination downstream instead of
+        # failing loudly at the one point where it's still cheap to catch.
+        proposed_time = datetime.strptime(data["proposed_time"], "%H:%M").strftime("%H:%M")
+    except (StopIteration, json.JSONDecodeError, KeyError, TypeError, ValueError):
         logger.warning(
             "Malformed agent response for user %s, round %d", profile.telegram_user_id, round_num, exc_info=True
         )
@@ -252,4 +292,67 @@ same rule as never restating your exact budget numbers."""
         stance=stance,
         reason=reason,
         counter_proposal=counter_proposal,
+        proposed_time=proposed_time,
     )
+
+
+_MISSING_INFO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "needs_question": {"type": "boolean"},
+        "question": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["needs_question", "question"],
+    "additionalProperties": False,
+}
+
+
+def get_missing_info_question(profile: UserProfile, goal_text: str) -> str | None:
+    """Dynamic-questions MVP — pre-round only, no mid-round follow-ups, no
+    stance/schema changes to get_agent_response or orchestrator.py at all.
+
+    Asks whether THIS specific request is missing something the person's
+    onboarding profile doesn't already cover, and if so, returns one short
+    question to ask them privately before round 1. Deliberately a separate,
+    smaller call from get_agent_response — this never touches the round loop
+    or the ACCEPT/REJECT/COUNTER contract.
+
+    Fails soft (returns None) on any error, same posture as
+    choir.bot.intent.is_planning_request — a broken classifier should
+    silently skip the optional question, never block or crash the negotiation.
+    """
+    system_prompt = f"""You are deciding whether to ask one clarifying question
+before privately negotiating on this person's behalf for a specific request.
+
+Known profile (do NOT ask about any of this — it's already answered):
+- Budget: {profile.budget_min}-{profile.budget_max}
+- Preferences: {", ".join(profile.preferences) or "none stated"}
+- Area: {profile.area}
+- Dietary notes: {profile.dietary_notes or "none"}
+- Other notes: {profile.notes or "none"}
+
+Current request: "{goal_text}"
+
+Identify at most ONE piece of information that is specific to THIS request,
+not already covered above, and would genuinely change how you'd negotiate on
+this person's behalf. Only ask if it's truly useful — don't ask just to ask.
+If nothing is missing, needs_question must be false and question must be null."""
+
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            system=system_prompt,
+            thinking={"type": "disabled"},
+            output_config={"format": {"type": "json_schema", "schema": _MISSING_INFO_SCHEMA}},
+            messages=[{"role": "user", "content": goal_text}],
+        )
+        text = next(block.text for block in response.content if block.type == "text")
+        data = json.loads(text)
+        return data["question"] if data["needs_question"] else None
+    except Exception:
+        logger.exception(
+            "Missing-info classification failed for user %s; skipping dynamic question",
+            profile.telegram_user_id,
+        )
+        return None

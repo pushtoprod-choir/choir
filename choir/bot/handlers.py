@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections import deque
+from datetime import datetime
 from urllib.parse import quote
 
 from telegram import Update
@@ -27,10 +28,13 @@ from choir.store.profiles import (
     record_calendar_events,
 )
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
+from choir.engine.agent import get_missing_info_question
 from choir.engine.orchestrator import format_transcript, run_negotiation
-from choir.venues.places import build_venue_query, find_venues
+from choir.venues.places import build_venue_query, find_venues, geocode_areas, haversine_distance_km
 from choir.venues.enrichment import enrich_venues
+from choir.actions.links import build_ride_deeplink, describe_ride_suggestion, find_carpool_pairs
 from choir.bot.intent import is_planning_request
+from choir.bot.date_extraction import extract_plan_date
 from choir.calendar.client import attach_calendar_availability
 from choir.calendar.scheduling import create_events_for_connected, delete_events_for_negotiation
 
@@ -40,12 +44,19 @@ from choir.calendar.scheduling import create_events_for_connected, delete_events
 # as long as we don't await between the check and the add.
 _active_negotiations: set[int] = set()
 
-# chat_id -> goal_text awaiting an occasion reply. Asked once per /choir
+
+@dataclasses.dataclass
+class _PendingPlan:
+    goal_text: str
+    plan_date: str   # "YYYY-MM-DD", already extracted and validated before the occasion question is asked
+
+
+# chat_id -> plan awaiting an occasion reply. Asked once per /choir plan
 # trigger before the actual negotiation starts: different reasons for the
 # same activity ("it's Priya's birthday" vs. "just a random Tuesday")
 # reasonably call for different tradeoffs, and the only way to know which is
 # to ask rather than assume.
-_pending_occasion: dict[int, str] = {}
+_pending_occasion: dict[int, _PendingPlan] = {}
 
 # chat_id -> the most recent converged decision, so "/choir update <reason>"
 # has something concrete to revise instead of starting blind.
@@ -57,7 +68,24 @@ _last_decision: dict[int, str] = {}
 # duplicate event on top of the stale one instead of replacing it.
 _last_negotiation_id: dict[int, int] = {}
 
+# chat_id -> that decision's plan_date, carried forward unchanged by a later
+# "/choir update <reason>" unless the reason itself names a new date — most
+# revisions (a venue swap, someone running late) don't touch the date at all.
+_last_plan_date: dict[int, str] = {}
+
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
+
+# user_id -> (chat_id, future) for an outstanding dynamic-question DM. Keyed
+# by user_id (not chat_id) since this is a private DM, not a group flow, and
+# is the first per-user (rather than per-chat) pending state in this file —
+# see _gather_dynamic_context for how a collision (same person flagged by two
+# concurrent negotiations) is handled.
+_pending_clarifications: dict[int, tuple[int, "asyncio.Future"]] = {}
+
+# Long enough to glance at a phone and reply, short enough that the group
+# doesn't feel like /choir hung. This is optional enrichment, not a hard
+# gate — a timeout just means proceeding without that person's answer.
+_CLARIFICATION_TIMEOUT_SECONDS = 45
 
 # Telegram's hard cap is 4096 chars; leave headroom below it since Markdown
 # entities and the surrounding reply text add to the same budget — this
@@ -174,6 +202,59 @@ async def _fallback_venue_suggestions(
     return _build_venues_text(venues, max_chars)
 
 
+def _format_plan_datetime(plan_date: str, decided_time: str) -> str:
+    """Human-readable rendering of the fixed plan_date plus the time the
+    agents actually converged on, e.g. "Saturday, August 15, 2026 at 7:30 PM"
+    — for the "Decision:" reply, not for anything downstream (the calendar
+    event uses the raw ISO values directly, see choir/calendar/scheduling.py)."""
+    date_part = datetime.strptime(plan_date, "%Y-%m-%d").strftime("%A, %B %d, %Y")
+    time_part = datetime.strptime(decided_time, "%H:%M").strftime("%I:%M %p").lstrip("0")
+    return f"{date_part} at {time_part}"
+
+
+async def _send_ride_suggestions(chat_id: int, profiles: list[UserProfile], venue: VenueResult, bot) -> None:
+    """Best-effort, DM-only ride-suggestion stub — not a real booking, just a
+    pre-filled Uber deep link plus a distance-based carpool nudge, sent
+    privately (pickup area is personal, same reasoning as budget). Skips
+    entirely if LocationIQ isn't configured or the venue has no real
+    coordinates; a failed DM to one person never blocks another's."""
+    location_iq_key = os.environ.get("LOCATION_IQ_API_KEY")
+    if not location_iq_key or not (venue.lat and venue.lon):
+        return
+
+    areas = list({p.area for p in profiles})
+    area_coords = await asyncio.to_thread(geocode_areas, areas, location_iq_key)
+    dropoff = (venue.lat, venue.lon)
+
+    user_coords: dict[int, tuple[float, float]] = {}
+    for profile in profiles:
+        pickup = area_coords.get(profile.area)
+        if pickup is None:
+            continue
+        user_coords[profile.telegram_user_id] = pickup
+
+        distance = haversine_distance_km(pickup, dropoff)
+        text = describe_ride_suggestion(distance, build_ride_deeplink(pickup, dropoff))
+        if not text:
+            continue
+        try:
+            await bot.send_message(chat_id=profile.telegram_user_id, text=text)
+        except Exception:
+            logging.exception("Failed to DM ride suggestion to user %s", profile.telegram_user_id)
+
+    for user_a, user_b, _distance in find_carpool_pairs(user_coords):
+        name_a = get_member_name(chat_id, user_a)
+        name_b = get_member_name(chat_id, user_b)
+        for this_user, other_name in ((user_a, name_b), (user_b, name_a)):
+            try:
+                await bot.send_message(
+                    chat_id=this_user,
+                    text=f"🚗 You and {other_name} are both nearby — might be worth sharing a ride tonight.",
+                )
+            except Exception:
+                logging.exception("Failed to DM carpool suggestion to user %s", this_user)
+
+
 def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
     member_ids = get_seen_members(chat_id)
     profiles = []
@@ -185,6 +266,97 @@ def _gather_profiles(chat_id: int) -> tuple[list[UserProfile], list[int]]:
         else:
             profiles.append(profile)
     return profiles, missing_users
+
+
+async def _gather_dynamic_context(message, profiles: list[UserProfile], goal_text: str) -> None:
+    """Pre-round-1 dynamic-questions phase (MVP: pre-round only, no mid-round
+    follow-ups, no changes to orchestrator.py's round loop or the
+    ACCEPT/REJECT/COUNTER contract). For each profile, asks its agent whether
+    this specific request is missing something onboarding didn't cover; DMs
+    whoever needs one, waits (bounded by _CLARIFICATION_TIMEOUT_SECONDS) for
+    replies, and folds answers into that profile's temporary_context IN
+    PLACE — same runtime-only, never-persisted pattern as
+    attach_calendar_availability populating calendar_busy_text. Best-effort:
+    a failed DM, a skip, or a timeout all just mean proceeding without that
+    person's answer, never blocking or crashing the negotiation."""
+    questions = await asyncio.gather(
+        *(asyncio.to_thread(get_missing_info_question, p, goal_text) for p in profiles)
+    )
+    flagged = [(p, q) for p, q in zip(profiles, questions) if q]
+    if not flagged:
+        return
+
+    loop = asyncio.get_event_loop()
+    bot = message.get_bot()
+    futures: dict[int, "asyncio.Future"] = {}
+
+    for profile, question in flagged:
+        user_id = profile.telegram_user_id
+        if user_id in _pending_clarifications:
+            # Already waiting on a clarification for this same person from a
+            # different concurrent negotiation (a different group) — fail
+            # open rather than clobber the other one's pending state or ask
+            # this person two questions from two bots-in-their-DMs at once.
+            continue
+        future = loop.create_future()
+        _pending_clarifications[user_id] = (message.chat_id, future)
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"Quick one before I negotiate on your behalf: {question}\n"
+                '(or reply "skip")',
+            )
+            futures[user_id] = future
+        except Exception:
+            logging.exception("Failed to DM clarifying question to user %s", user_id)
+            _pending_clarifications.pop(user_id, None)
+
+    if not futures:
+        return
+
+    done, _pending = await asyncio.wait(
+        futures.values(), timeout=_CLARIFICATION_TIMEOUT_SECONDS
+    )
+
+    for user_id, future in futures.items():
+        _pending_clarifications.pop(user_id, None)
+        if future in done:
+            answer = future.result()
+            if answer:
+                for profile in profiles:
+                    if profile.telegram_user_id == user_id:
+                        profile.temporary_context = answer
+                        break
+        else:
+            future.cancel()
+
+
+async def handle_clarification_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the plain-text DM reply to a dynamic clarifying question. A
+    no-op for every message except one from a user with an outstanding
+    clarification — mirrors handle_occasion_reply's shape, but keyed by
+    user_id (a DM) instead of chat_id (a group)."""
+    message = update.message
+    if (
+        message is None
+        or message.from_user is None
+        or message.from_user.is_bot
+        or not message.text
+    ):
+        return
+
+    user_id = message.from_user.id
+    pending = _pending_clarifications.get(user_id)
+    if pending is None:
+        return
+
+    _, future = pending
+    if future.done():
+        return
+
+    answer = message.text.strip()
+    future.set_result(None if answer.lower() in _SKIP_WORDS else answer)
+    await message.reply_text("Got it, thanks!")
 
 
 async def track_group_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,10 +385,11 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not args:
         await message.reply_text(
-            "Tell me what you want to plan — e.g. /choir plan lunch for us\n"
-            "Or revise the last plan: /choir update <what changed>\n"
-            "Planning something bigger? /choir start trip <optional description> "
-            "then /choir end trip when you're done.",
+            "Here's what I understand:\n"
+            "/choir start trip <title> — kick off a new trip\n"
+            "/choir plan <what you want> — negotiate something within the current trip\n"
+            "/choir update <what changed> — revise the last decision\n"
+            "/choir end trip — wrap up the current trip",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -235,8 +408,25 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    is_start_trip = len(args) >= 2 and args[0].lower() == "start" and args[1].lower() == "trip"
-    is_end_trip = len(args) >= 2 and args[0].lower() == "end" and args[1].lower() == "trip"
+    command = args[0].lower()
+    is_start_trip = command == "start" and len(args) >= 2 and args[1].lower() == "trip"
+    is_end_trip = command == "end" and len(args) >= 2 and args[1].lower() == "trip"
+    is_plan = command == "plan"
+    is_update = command == "update"
+
+    # Only these four forms are recognized — anything else (including the
+    # old bare "/choir <freeform goal>" form) is rejected outright rather
+    # than guessed at.
+    if not (is_start_trip or is_end_trip or is_plan or is_update):
+        await message.reply_text(
+            "I only understand:\n"
+            "/choir start trip <title>\n"
+            "/choir plan <what you want>\n"
+            "/choir update <what changed>\n"
+            "/choir end trip",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     if is_start_trip:
         if get_active_trip(message.chat_id) is not None:
@@ -266,7 +456,11 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         trip_negotiations = get_trip_negotiations(active_trip["id"])
         decided = [n for n in trip_negotiations if n["converged"] and n["decision"]]
         summary = (
-            "\n".join(f"• {n['goal_text']}: {n['decision']}" for n in decided)
+            "\n".join(
+                f"• {n['goal_text']}: {n['decision']}"
+                + (f" on {n['plan_date']} at {n['decided_time']}" if n["plan_date"] and n["decided_time"] else "")
+                for n in decided
+            )
             if decided
             else "No decisions were finalized during this trip."
         )
@@ -279,7 +473,14 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    is_update = args[0].lower() == "update"
+    # "plan" only makes sense inside a trip — it's the container decisions
+    # get tagged against and rolled up into when the trip ends.
+    if get_active_trip(message.chat_id) is None:
+        await message.reply_text(
+            "Start a trip first — /choir start trip <title> — before planning.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     # /choir itself counts as being "seen" in this chat
     record_seen_member(
@@ -310,6 +511,7 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if is_update:
         previous = _last_decision.get(message.chat_id)
         previous_negotiation_id = _last_negotiation_id.get(message.chat_id)
+        previous_plan_date = _last_plan_date.get(message.chat_id)
         if previous is None:
             # In-memory state doesn't survive a restart — the persisted log
             # does. Falls back to it so "/choir update" still works after
@@ -322,9 +524,10 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
             if match:
                 previous = match["decision"]
                 previous_negotiation_id = match["id"]
+                previous_plan_date = match["plan_date"]
         if previous is None:
             await message.reply_text(
-                "There's no previous plan for this group to update yet — use /choir <what you want> to start one.",
+                "There's no previous plan for this group to update yet — use /choir plan <what you want> to start one.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -345,12 +548,33 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
             f"We previously agreed on: {previous}. That needs to change because: {reason}. "
             f"Come up with an updated plan that addresses this."
         )
-        await _run_negotiation(message, goal_text, replaces_negotiation_id=previous_negotiation_id)
+        # The revision reason might itself name a new date (e.g. "let's push
+        # it to next Saturday instead") — try that first, otherwise carry the
+        # original plan's date forward unchanged, since most revisions (a
+        # venue swap, someone running late) don't touch the date at all.
+        plan_date = await asyncio.to_thread(extract_plan_date, reason) or previous_plan_date
+        if plan_date is None:
+            await message.reply_text(
+                "What date is this for? Include one and try again — e.g. "
+                "/choir update moved to Sunday instead",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        await _run_negotiation(
+            message, goal_text, plan_date, skip_dynamic_questions=True,
+            replaces_negotiation_id=previous_negotiation_id,
+        )
         return
 
-    goal_text = " ".join(args)
+    goal_text = " ".join(args[1:]).strip()
+    if not goal_text:
+        await message.reply_text(
+            "Tell me what you want to plan — e.g. /choir plan lunch for us",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
-    # Cheap gate so "/choir what's up" doesn't spin up a full negotiation —
+    # Cheap gate so "/choir plan what's up" doesn't spin up a full negotiation —
     # only actually negotiate when this reads like a genuine planning ask.
     # Runs after the profile checks above (not before) so a group that
     # hasn't onboarded yet gets the onboarding prompt without spending an
@@ -362,7 +586,19 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    _pending_occasion[message.chat_id] = goal_text
+    # The date is fixed by this command and never negotiated — only the time
+    # is left for the agents to decide (see choir/engine). No date mentioned
+    # here means the command fails outright rather than guessing one.
+    plan_date = await asyncio.to_thread(extract_plan_date, goal_text)
+    if plan_date is None:
+        await message.reply_text(
+            "What date is this for? Include one and try again — e.g. "
+            "/choir plan dinner this Saturday",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    _pending_occasion[message.chat_id] = _PendingPlan(goal_text=goal_text, plan_date=plan_date)
     await message.reply_text(
         "Quick one before I start — what's the occasion? "
         '(e.g. birthday, casual hangout, work catch-up — or reply "skip")',
@@ -391,20 +627,24 @@ async def handle_occasion_reply(update: Update, context: ContextTypes.DEFAULT_TY
     if chat_id not in _pending_occasion:
         return
 
-    goal_text = _pending_occasion.pop(chat_id)
+    pending = _pending_occasion.pop(chat_id)
+    goal_text = pending.goal_text
     occasion = message.text.strip()
     if occasion.lower() not in _SKIP_WORDS:
         goal_text = f"{goal_text} (occasion: {occasion})"
 
-    await _run_negotiation(message, goal_text)
+    await _run_negotiation(message, goal_text, pending.plan_date)
 
 
-async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int | None = None):
+async def _run_negotiation(
+    message, goal_text: str, plan_date: str, skip_dynamic_questions: bool = False,
+    replaces_negotiation_id: int | None = None,
+):
     """replaces_negotiation_id, when set (only by the /choir update path),
     is the negotiation whose calendar events (if any) should be deleted once
     this one produces a new decision — see the calendar-replace block below.
-    A plain new /choir on an unrelated topic leaves this None, since that's
-    a separate plan, not a revision of an existing one."""
+    A plain new /choir plan on an unrelated topic leaves this None, since
+    that's a separate plan, not a revision of an existing one."""
     # Profiles/membership could in principle change in the gap between the
     # /choir trigger and the occasion reply — recheck here rather than trust
     # state gathered earlier in a different handler invocation.
@@ -421,10 +661,18 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
     # so this is a no-op for groups where nobody's connected their calendar.
     await asyncio.to_thread(attach_calendar_availability, profiles)
 
+    # skip_dynamic_questions=True for "/choir update <reason>": an explicit
+    # revision command doesn't need re-clarifying — the reason for changing
+    # already provides fresh context, same rationale as skipping the
+    # occasion question and intent-gating on that path.
+    if not skip_dynamic_questions:
+        await _gather_dynamic_context(message, profiles, goal_text)
+
     request = NegotiationRequest(
         group_chat_id=message.chat_id,
         goal_text=goal_text,
         profiles=profiles,
+        plan_date=plan_date,
     )
 
     # Append-only audit log — written incrementally per round (not just at
@@ -436,7 +684,7 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
     # later roll up every decision made while it was open.
     active_trip = get_active_trip(message.chat_id)
     trip_id = active_trip["id"] if active_trip else None
-    negotiation_id = start_negotiation_log(message.chat_id, goal_text, trip_id=trip_id)
+    negotiation_id = start_negotiation_log(message.chat_id, goal_text, trip_id=trip_id, plan_date=plan_date)
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
         lines = [f"🔁 *Round {round_num + 1}*"]
@@ -475,7 +723,7 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
         _active_negotiations.discard(message.chat_id)
 
     finish_negotiation_log(
-        negotiation_id, converged=result.converged, decision=result.decision
+        negotiation_id, converged=result.converged, decision=result.decision, decided_time=result.decided_time
     )
 
     # Nudges each person's own preference confidence based on THEIR final-round
@@ -497,11 +745,17 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
 
     if result.converged:
         # Remembered so a later "/choir update <reason>" has something to
-        # revise, and so that update's own eventual new decision knows which
-        # negotiation's calendar events to replace.
+        # revise, knows which negotiation's calendar events to replace, and
+        # (absent a new date in the revision reason) which date to carry
+        # forward unchanged.
         _last_decision[message.chat_id] = result.decision
         _last_negotiation_id[message.chat_id] = negotiation_id
-        reply = f"🎉 *Decision:* {result.decision}\n\n{result.explanation}"
+        _last_plan_date[message.chat_id] = plan_date
+        reply = (
+            f"🎉 *Decision:* {result.decision}\n"
+            f"📅 {_format_plan_datetime(plan_date, result.decided_time)}\n\n"
+            f"{result.explanation}"
+        )
         if result.tradeoffs:
             reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
 
@@ -516,11 +770,14 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
 
         # None means nobody in this group is calendar-connected — a true
         # no-op, keeping this line absent entirely for unconnected groups.
+        # The event is created at exactly plan_date + result.decided_time —
+        # both guaranteed present on convergence, no extraction guess needed.
         calendar_summary = await asyncio.to_thread(
-            create_events_for_connected, profiles, goal_text, result.decision
+            create_events_for_connected,
+            profiles, result.decision, plan_date, result.decided_time, result.decided_venue,
         )
         if calendar_summary is not None:
-            if calendar_summary.extraction_failed:
+            if calendar_summary.build_failed:
                 reply += "\n\n📅 Couldn't auto-schedule this — add it to your calendar manually."
             else:
                 reply += f"\n\n📅 Added to {calendar_summary.created}/{calendar_summary.connected} connected calendars."
@@ -555,6 +812,11 @@ async def _run_negotiation(message, goal_text: str, replaces_negotiation_id: int
                 "Failed to send decision message; retrying without venues"
             )
             await message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+        if result.decided_venue:
+            # Trailing, best-effort step — runs after the main decision
+            # message so a failure here can never affect or delay it.
+            await _send_ride_suggestions(message.chat_id, profiles, result.decided_venue, message.get_bot())
     else:
         options_text = "\n".join(f"• {opt}" for opt in result.top_options)
         base = f"🤔 *Couldn't fully agree — here are the top options:*\n{options_text}"

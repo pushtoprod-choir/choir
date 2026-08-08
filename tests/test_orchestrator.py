@@ -14,6 +14,7 @@ from unittest.mock import patch
 from choir.engine.orchestrator import (
     _round_budget,
     _select_next_proposal,
+    _select_next_time,
     _verify_decision,
     format_transcript,
     run_negotiation,
@@ -24,12 +25,15 @@ USER_A = UserProfile(telegram_user_id=1, budget_min=100, budget_max=300, prefere
 USER_B = UserProfile(telegram_user_id=2, budget_min=200, budget_max=600, preferences=[], area="HSR")
 USER_C = UserProfile(telegram_user_id=3, budget_min=150, budget_max=500, preferences=[], area="HSR")
 
+PLAN_DATE = "2026-08-15"
+
 
 def scripted(responses: dict[tuple[int, str | None], AgentSignal]):
     """Builds a get_agent_response stand-in keyed by (user_id, current_proposal),
     so each test can spell out exactly what every person says on every round."""
 
-    def fake(profile, goal_text, current_proposal, round_num=0, max_rounds=1, candidates=None, other_signals=None):
+    def fake(profile, goal_text, plan_date, current_proposal, current_time,
+             round_num=0, max_rounds=1, candidates=None, other_signals=None):
         return responses[(profile.telegram_user_id, current_proposal)]
 
     return fake
@@ -39,20 +43,21 @@ class TestOrchestrator(unittest.TestCase):
     @patch("choir.engine.orchestrator.get_agent_response")
     def test_converges_after_a_counter_is_accepted(self, mock_get):
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits my budget", counter_proposal="Cafe A"),
-            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="want to see other options"),
-            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works"),
-            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine by me"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits my budget", counter_proposal="Cafe A", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="want to see other options", proposed_time="19:00"),
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works", proposed_time="19:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine by me", proposed_time="19:00"),
         })
 
         rounds_seen = []
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B]),
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE),
             on_round=lambda round_num, signals: rounds_seen.append((round_num, len(signals))),
         )
 
         self.assertTrue(result.converged)
         self.assertEqual(result.decision, "Cafe A")
+        self.assertEqual(result.decided_time, "19:00")
         self.assertEqual(result.tradeoffs, ["still works", "fine by me"])
         # on_round fired once per round actually run (2 here), each with both signals
         self.assertEqual(rounds_seen, [(0, 2), (1, 2)])
@@ -62,16 +67,37 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(result.rounds[1][1].stance, "ACCEPT")
 
     @patch("choir.engine.orchestrator.get_agent_response")
-    def test_format_transcript_reads_back_the_full_negotiation(self, mock_get):
+    def test_converges_on_a_time_the_majority_agrees_on_even_with_a_holdout(self, mock_get):
+        # Venue converges round 1; the time takes a round longer since user 2
+        # initially wants something different — decided_time must reflect
+        # whatever time was actually on the table when everyone finally
+        # accepted, not just whoever proposed first.
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits my budget", counter_proposal="Cafe A"),
-            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="want to see other options"),
-            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works"),
-            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine by me"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="Cafe A", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="COUNTER", reason="r1", counter_proposal="Cafe A", proposed_time="20:00"),
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="r2", proposed_time="19:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="r2", proposed_time="19:00"),
         })
 
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B])
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE),
+        )
+
+        self.assertTrue(result.converged)
+        self.assertEqual(result.decision, "Cafe A")
+        self.assertEqual(result.decided_time, "19:00")
+
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_format_transcript_reads_back_the_full_negotiation(self, mock_get):
+        mock_get.side_effect = scripted({
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits my budget", counter_proposal="Cafe A", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="want to see other options", proposed_time="19:00"),
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="ACCEPT", reason="still works", proposed_time="19:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="ACCEPT", reason="fine by me", proposed_time="19:00"),
+        })
+
+        result = run_negotiation(
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE)
         )
         transcript = format_transcript(result.rounds)
 
@@ -79,6 +105,7 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIn("Round 2:", transcript)
         self.assertIn("proposes: Cafe A", transcript)
         self.assertIn("2: ACCEPT — fine by me", transcript)
+        self.assertIn("(time: 19:00)", transcript)
 
     @patch("choir.engine.orchestrator.get_agent_response")
     def test_round_one_all_accept_does_not_falsely_converge(self, mock_get):
@@ -87,33 +114,34 @@ class TestOrchestrator(unittest.TestCase):
         # agent replies ACCEPT before anything is on the table, the engine must
         # NOT report "converged" on a None decision.
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="ACCEPT", reason="sure, whatever"),
-            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="works for me"),
+            (1, None): AgentSignal(user_id=1, stance="ACCEPT", reason="sure, whatever", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="works for me", proposed_time="19:00"),
         })
 
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B])
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE)
         )
 
         self.assertFalse(result.converged)
         self.assertIsNone(result.decision)
+        self.assertIsNone(result.decided_time)
         self.assertEqual(result.top_options, [])
 
     @patch("choir.engine.orchestrator.get_agent_response")
     def test_non_convergence_dedups_and_caps_top_options(self, mock_get):
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="Cafe A"),
-            (2, None): AgentSignal(user_id=2, stance="COUNTER", reason="r1", counter_proposal="Cafe B"),
-            (1, "Cafe A"): AgentSignal(user_id=1, stance="REJECT", reason="r2"),
-            (2, "Cafe A"): AgentSignal(user_id=2, stance="COUNTER", reason="r2", counter_proposal="Cafe B"),  # repeat
-            (1, "Cafe B"): AgentSignal(user_id=1, stance="COUNTER", reason="r3", counter_proposal="Cafe C"),
-            (2, "Cafe B"): AgentSignal(user_id=2, stance="REJECT", reason="r3"),
-            (1, "Cafe C"): AgentSignal(user_id=1, stance="REJECT", reason="r4"),
-            (2, "Cafe C"): AgentSignal(user_id=2, stance="REJECT", reason="r4"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="Cafe A", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="COUNTER", reason="r1", counter_proposal="Cafe B", proposed_time="19:00"),
+            (1, "Cafe A"): AgentSignal(user_id=1, stance="REJECT", reason="r2", proposed_time="19:00"),
+            (2, "Cafe A"): AgentSignal(user_id=2, stance="COUNTER", reason="r2", counter_proposal="Cafe B", proposed_time="19:00"),  # repeat
+            (1, "Cafe B"): AgentSignal(user_id=1, stance="COUNTER", reason="r3", counter_proposal="Cafe C", proposed_time="19:00"),
+            (2, "Cafe B"): AgentSignal(user_id=2, stance="REJECT", reason="r3", proposed_time="19:00"),
+            (1, "Cafe C"): AgentSignal(user_id=1, stance="REJECT", reason="r4", proposed_time="19:00"),
+            (2, "Cafe C"): AgentSignal(user_id=2, stance="REJECT", reason="r4", proposed_time="19:00"),
         })
 
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B])
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE)
         )
 
         self.assertFalse(result.converged)
@@ -129,16 +157,16 @@ class TestOrchestrator(unittest.TestCase):
         # different options, inflating (and confusing) the non-convergence
         # report with what's really one repeated suggestion.
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="Cafe A, HSR"),
-            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="r1"),
-            (1, "Cafe A, HSR"): AgentSignal(user_id=1, stance="REJECT", reason="r2"),
-            (2, "Cafe A, HSR"): AgentSignal(user_id=2, stance="COUNTER", reason="r2", counter_proposal="cafe a,  hsr"),
-            (1, "cafe a,  hsr"): AgentSignal(user_id=1, stance="REJECT", reason="r3"),
-            (2, "cafe a,  hsr"): AgentSignal(user_id=2, stance="REJECT", reason="r3"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="Cafe A, HSR", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="REJECT", reason="r1", proposed_time="19:00"),
+            (1, "Cafe A, HSR"): AgentSignal(user_id=1, stance="REJECT", reason="r2", proposed_time="19:00"),
+            (2, "Cafe A, HSR"): AgentSignal(user_id=2, stance="COUNTER", reason="r2", counter_proposal="cafe a,  hsr", proposed_time="19:00"),
+            (1, "cafe a,  hsr"): AgentSignal(user_id=1, stance="REJECT", reason="r3", proposed_time="19:00"),
+            (2, "cafe a,  hsr"): AgentSignal(user_id=2, stance="REJECT", reason="r3", proposed_time="19:00"),
         })
 
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B])
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE)
         )
 
         self.assertFalse(result.converged)
@@ -154,16 +182,20 @@ class TestOrchestrator(unittest.TestCase):
         # so its prompt can make holding-out have a real, escalating cost.
         seen_calls: list[tuple[str | None, int, int]] = []
 
-        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
+        def fake(profile, goal_text, plan_date, current_proposal, current_time,
+                 round_num, max_rounds, candidates=None, other_signals=None):
             seen_calls.append((current_proposal, round_num, max_rounds))
             # Always COUNTER with the same option — keeps the loop alive for
             # the full MAX_ROUNDS without ever converging, so every round
             # actually runs and we can check round_num incremented correctly.
-            return AgentSignal(user_id=profile.telegram_user_id, stance="COUNTER", reason="testing", counter_proposal="Option X")
+            return AgentSignal(
+                user_id=profile.telegram_user_id, stance="COUNTER", reason="testing",
+                counter_proposal="Option X", proposed_time="19:00",
+            )
 
         mock_get.side_effect = fake
 
-        run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B]))
+        run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
 
         # 2 people x 4 rounds, round_num incrementing 0..3, max_rounds always 4
         self.assertEqual(len(seen_calls), 8)
@@ -183,31 +215,33 @@ class TestOrchestrator(unittest.TestCase):
         # so the shared scripted() helper (keyed by (user_id, current_proposal))
         # can't distinguish them — this needs round_num too, hence a bespoke
         # stateful fake instead.
-        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
+        def fake(profile, goal_text, plan_date, current_proposal, current_time,
+                 round_num, max_rounds, candidates=None, other_signals=None):
             if current_proposal is None:
                 return {
-                    1: AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="X"),
-                    2: AgentSignal(user_id=2, stance="COUNTER", reason="r1", counter_proposal="Y"),
-                    3: AgentSignal(user_id=3, stance="REJECT", reason="r1"),
+                    1: AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="X", proposed_time="19:00"),
+                    2: AgentSignal(user_id=2, stance="COUNTER", reason="r1", counter_proposal="Y", proposed_time="19:00"),
+                    3: AgentSignal(user_id=3, stance="REJECT", reason="r1", proposed_time="19:00"),
                 }[profile.telegram_user_id]
             if current_proposal == "X" and round_num == 1:
                 return {
-                    1: AgentSignal(user_id=1, stance="ACCEPT", reason="r2"),
-                    2: AgentSignal(user_id=2, stance="ACCEPT", reason="r2"),
-                    3: AgentSignal(user_id=3, stance="COUNTER", reason="r2", counter_proposal="Y"),
+                    1: AgentSignal(user_id=1, stance="ACCEPT", reason="r2", proposed_time="19:00"),
+                    2: AgentSignal(user_id=2, stance="ACCEPT", reason="r2", proposed_time="19:00"),
+                    3: AgentSignal(user_id=3, stance="COUNTER", reason="r2", counter_proposal="Y", proposed_time="19:00"),
                 }[profile.telegram_user_id]
             # Round 3: everyone finally converges on X, now that it survived
             # the holdout's round-2 counter instead of being abandoned for Y.
-            return AgentSignal(user_id=profile.telegram_user_id, stance="ACCEPT", reason="r3")
+            return AgentSignal(user_id=profile.telegram_user_id, stance="ACCEPT", reason="r3", proposed_time="19:00")
 
         mock_get.side_effect = fake
 
         result = run_negotiation(
-            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B, USER_C])
+            NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B, USER_C], plan_date=PLAN_DATE)
         )
 
         self.assertTrue(result.converged)
         self.assertEqual(result.decision, "X")
+        self.assertEqual(result.decided_time, "19:00")
 
     @patch("choir.engine.orchestrator.get_agent_response")
     def test_agents_see_last_rounds_signals_from_everyone_but_themselves(self, mock_get):
@@ -217,18 +251,19 @@ class TestOrchestrator(unittest.TestCase):
         # conflict instead of reacting to one flattened proposal string.
         calls_by_round: dict[int, list] = {}
 
-        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
+        def fake(profile, goal_text, plan_date, current_proposal, current_time,
+                 round_num, max_rounds, candidates=None, other_signals=None):
             calls_by_round.setdefault(round_num, []).append((profile.telegram_user_id, other_signals))
             if round_num == 0:
                 return AgentSignal(
                     user_id=profile.telegram_user_id, stance="COUNTER", reason=f"r1-{profile.telegram_user_id}",
-                    counter_proposal=f"Option{profile.telegram_user_id}",
+                    counter_proposal=f"Option{profile.telegram_user_id}", proposed_time="19:00",
                 )
-            return AgentSignal(user_id=profile.telegram_user_id, stance="REJECT", reason="r2")
+            return AgentSignal(user_id=profile.telegram_user_id, stance="REJECT", reason="r2", proposed_time="19:00")
 
         mock_get.side_effect = fake
 
-        run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B]))
+        run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
 
         # Round 1 (index 0): nothing to see yet.
         self.assertTrue(all(other is None for _, other in calls_by_round[0]))
@@ -303,6 +338,42 @@ class TestSelectNextProposal(unittest.TestCase):
         self.assertEqual(_select_next_proposal(None, signals), "Whitefield")
 
 
+class TestSelectNextTime(unittest.TestCase):
+    """Mirrors TestSelectNextProposal's coverage, applied to proposed_time
+    instead of counter_proposal — same majority-survives / plurality-wins
+    rules, just for the clock instead of the venue."""
+
+    def test_keeps_current_time_when_majority_already_agrees(self):
+        signals = [
+            AgentSignal(user_id=1, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            AgentSignal(user_id=3, stance="COUNTER", reason="nah", proposed_time="20:00"),
+        ]
+        self.assertEqual(_select_next_time("19:00", signals), "19:00")
+
+    def test_switches_when_no_majority_agrees_with_current_time(self):
+        signals = [
+            AgentSignal(user_id=1, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            AgentSignal(user_id=2, stance="COUNTER", reason="nah", proposed_time="20:00"),
+            AgentSignal(user_id=3, stance="COUNTER", reason="nah", proposed_time="20:00"),
+        ]
+        self.assertEqual(_select_next_time("19:00", signals), "20:00")
+
+    def test_first_round_takes_the_plurality_winner(self):
+        signals = [
+            AgentSignal(user_id=1, stance="COUNTER", reason="", proposed_time="19:00"),
+            AgentSignal(user_id=2, stance="COUNTER", reason="", proposed_time="19:00"),
+            AgentSignal(user_id=3, stance="COUNTER", reason="", proposed_time="20:00"),
+        ]
+        self.assertEqual(_select_next_time(None, signals), "19:00")
+
+    def test_no_signals_have_a_time_keeps_current_time(self):
+        # Shouldn't happen with real agents (proposed_time is required), but
+        # a signal list with nothing to tally must not crash.
+        signals = [AgentSignal(user_id=1, stance="REJECT", reason="")]
+        self.assertIsNone(_select_next_time(None, signals))
+
+
 class TestVerifyDecision(unittest.TestCase):
     """_verify_decision is the deterministic hard-constraint check — real
     haversine distance against real geocoded coordinates, no LLM call, and
@@ -354,16 +425,17 @@ class TestVenueGroundedNegotiation(unittest.TestCase):
         venue = VenueResult(name="Real Cafe", address="HSR", rating=0, price_level=0, lat=12.90, lon=77.60)
         mock_fetch.return_value = ([venue], {"HSR": (12.90, 77.60)})
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits", counter_proposal="Real Cafe"),
-            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="fine"),
-            (1, "Real Cafe"): AgentSignal(user_id=1, stance="ACCEPT", reason="great"),
-            (2, "Real Cafe"): AgentSignal(user_id=2, stance="ACCEPT", reason="great"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="fits", counter_proposal="Real Cafe", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            (1, "Real Cafe"): AgentSignal(user_id=1, stance="ACCEPT", reason="great", proposed_time="19:00"),
+            (2, "Real Cafe"): AgentSignal(user_id=2, stance="ACCEPT", reason="great", proposed_time="19:00"),
         })
 
-        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B]))
+        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
 
         self.assertTrue(result.converged)
         self.assertEqual(result.decision, "Real Cafe")
+        self.assertEqual(result.decided_time, "19:00")
         self.assertIsNotNone(result.decided_venue)
         self.assertEqual(result.decided_venue.name, "Real Cafe")
 
@@ -373,13 +445,13 @@ class TestVenueGroundedNegotiation(unittest.TestCase):
         far_venue = VenueResult(name="Far Cafe", address="far away", rating=0, price_level=0, lat=13.15, lon=77.60)
         mock_fetch.return_value = ([far_venue], {"HSR": (12.90, 77.60)})
         mock_get.side_effect = scripted({
-            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="ok", counter_proposal="Far Cafe"),
-            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="fine"),
-            (1, "Far Cafe"): AgentSignal(user_id=1, stance="ACCEPT", reason="great"),
-            (2, "Far Cafe"): AgentSignal(user_id=2, stance="ACCEPT", reason="great"),
+            (1, None): AgentSignal(user_id=1, stance="COUNTER", reason="ok", counter_proposal="Far Cafe", proposed_time="19:00"),
+            (2, None): AgentSignal(user_id=2, stance="ACCEPT", reason="fine", proposed_time="19:00"),
+            (1, "Far Cafe"): AgentSignal(user_id=1, stance="ACCEPT", reason="great", proposed_time="19:00"),
+            (2, "Far Cafe"): AgentSignal(user_id=2, stance="ACCEPT", reason="great", proposed_time="19:00"),
         })
 
-        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B]))
+        result = run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="lunch", profiles=[USER_A, USER_B], plan_date=PLAN_DATE))
 
         # Both agents ACCEPTed unanimously, but the venue is ~28km from HSR —
         # the deterministic check must override the LLM's "unanimous" claim
@@ -387,6 +459,7 @@ class TestVenueGroundedNegotiation(unittest.TestCase):
         self.assertFalse(result.converged)
         self.assertIsNone(result.decision)
         self.assertIsNone(result.decided_venue)
+        self.assertIsNone(result.decided_time)
 
 
 class TestRoundBudget(unittest.TestCase):

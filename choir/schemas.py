@@ -26,6 +26,8 @@ class NegotiationRequest:
     group_chat_id: int
     goal_text: str                # raw text after the /choir command, e.g. "plan lunch for us"
     profiles: list[UserProfile]
+    plan_date: str                 # "YYYY-MM-DD", extracted from the /choir plan text up front — fixed,
+                                    # never negotiated; only the time is left for the agents to decide
 
 
 @dataclass
@@ -34,6 +36,8 @@ class AgentSignal:
     stance: str                   # "ACCEPT" | "REJECT" | "COUNTER"
     reason: str                   # short, human-readable
     counter_proposal: Optional[str] = None
+    proposed_time: Optional[str] = None   # "HH:MM" 24-hour — the time this person is proposing/confirming for
+                                           # plan_date; None only on an error-path fallback signal (see agent.py)
 
 
 @dataclass
@@ -67,6 +71,8 @@ class NegotiationResult:
     decided_venue: Optional[VenueResult] = None  # the REAL venue `decision` resolved to, when the negotiation had
                                                   # real candidates to choose from — None if venues were unavailable
                                                   # (LocationIQ down/unconfigured) and the decision is still free text
+    decided_time: Optional[str] = None  # "HH:MM" 24-hour, the time the group actually converged on — always set
+                                         # together with `decision` on convergence, always None otherwise
 
 
 @dataclass
@@ -89,7 +95,9 @@ class EventDetails:
 class CalendarCreationSummary:
     connected: int
     created: int
-    extraction_failed: bool = False
+    build_failed: bool = False   # True only if plan_date/decided_time couldn't be combined into a real
+                                  # datetime — shouldn't happen given the negotiation contract, but guarded
+                                  # rather than trusted blindly (see choir.calendar.scheduling.build_event_details)
     event_ids: dict = field(default_factory=dict)  # telegram_user_id -> Google Calendar event id, for the ones
                                                      # actually created — lets the caller persist them so a later
                                                      # /choir update can delete exactly these events instead of
