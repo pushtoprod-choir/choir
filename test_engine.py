@@ -8,12 +8,15 @@ straight into run_negotiation(), reading whatever comes back. If every agent
 agrees instantly with no back-and-forth, the system prompt in agent.py needs
 tuning — that's the thing to watch for here, not just "did it crash."
 """
+import logging
+
 from dotenv import load_dotenv
 
 # Must run before the choir.engine import below: agent.py builds its Anthropic
 # client at module import time, so ANTHROPIC_API_KEY needs to already be in
 # the environment by then, not after.
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from choir.engine.orchestrator import run_negotiation
 from choir.schemas import NegotiationRequest, UserProfile

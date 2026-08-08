@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 
@@ -8,6 +9,13 @@ from dotenv import load_dotenv
 # client at module import time, so ANTHROPIC_API_KEY has to already be in the
 # environment by the time that import happens, not after.
 load_dotenv()
+
+# Without a configured root logger, INFO-level logging.getLogger(__name__)
+# calls in choir.engine.* are silently dropped — Python's logging module has
+# no default handler above WARNING. This is what makes round outcomes,
+# convergence, and parse-failure warnings actually visible in the console
+# instead of a real failure being undiagnosable after the fact.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from aiohttp import web
 from telegram.ext import (
@@ -22,7 +30,7 @@ from telegram.ext import (
 
 from choir.store.profiles import init_db
 from choir.bot.calendar_commands import cmd_connect_calendar
-from choir.bot.handlers import handle_choir_command, track_group_member
+from choir.bot.handlers import handle_choir_command, handle_occasion_reply, track_group_member
 from choir.bot.onboarding import (
     start_onboarding,
     handle_budget,
@@ -49,6 +57,10 @@ async def main():
 
     app.add_handler(CommandHandler("choir", handle_choir_command))
     app.add_handler(CommandHandler("connect_calendar", cmd_connect_calendar))
+    # Catches the plain-text reply to "what's the occasion?" — a no-op for any
+    # chat that isn't actually waiting on one, so it coexists with the
+    # catch-all seen-member tracker below rather than replacing it.
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handle_occasion_reply))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.ALL, track_group_member), group=1)
 
     onboarding_handler = ConversationHandler(

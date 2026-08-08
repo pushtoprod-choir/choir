@@ -17,15 +17,18 @@ logger = logging.getLogger(__name__)
 
 client = Anthropic()
 
-# MODEL = "not-a-real-model"
 MODEL = "claude-haiku-4-5"
 # MODEL = "claude-sonnet-5"
 
-ENRICH_TIMEOUT_SECONDS = 8
+# 8s was the original value but empirically times out with web_search across
+# more than one venue — a single-venue lookup alone took ~10s in testing.
+ENRICH_TIMEOUT_SECONDS = 20
 
 # web_search grounding sometimes wraps cited claims in <cite>...</cite> even
 # though we never enabled the citations feature — strip it so raw markup
-# doesn't leak into the note shown in the group chat.
+# doesn't leak into the note shown in the group chat. output_config.format
+# below guarantees the response's JSON *shape*, not what's inside the string
+# values, so this is still needed on top of it.
 _CITE_PAIR_RE = re.compile(r"<cite[^>]*>(.*?)</cite>", re.DOTALL)
 _CITE_STRAY_RE = re.compile(r"</?cite[^>]*>")
 
@@ -33,6 +36,27 @@ _CITE_STRAY_RE = re.compile(r"</?cite[^>]*>")
 def _strip_citations(text: str) -> str:
     text = _CITE_PAIR_RE.sub(r"\1", text)
     return _CITE_STRAY_RE.sub("", text).strip()
+
+# output_config.format guarantees the response is exactly this shape — this
+# replaces manually stripping ```json fences and hoping the model didn't add
+# commentary around the array, which was the same brittle-parsing pattern
+# agent.py deliberately avoids elsewhere in this codebase.
+NOTE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "notes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"note": {"type": "string"}},
+                "required": ["note"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["notes"],
+    "additionalProperties": False,
+}
 
 
 def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
@@ -42,11 +66,10 @@ def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
     venue_lines = "\n".join(f"{i}. {v.name} — {v.address}" for i, v in enumerate(venues))
     prompt = (
         f"Look up each of these {purpose.replace('_', ' ')} venues and write one short "
-        "phrase per venue covering rating, price, and vibe if you can find it.\n\n"
-        f"{venue_lines}\n\n"
-        "Respond with ONLY a JSON array, one object per venue in the same order, each "
-        'shaped like {"note": "<short phrase>"} — use an empty string for a venue if you '
-        "can't find anything useful. No other text."
+        "phrase per venue covering rating, price, and vibe if you can find it. Use an "
+        "empty string for a venue if you can't find anything useful. The note itself must "
+        "be just the phrase — do not repeat the venue's number or name in it.\n\n"
+        f"{venue_lines}"
     )
 
     try:
@@ -54,21 +77,18 @@ def enrich_venues(venues: list[VenueResult], purpose: str) -> list[VenueResult]:
             model=MODEL,
             max_tokens=1024,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            output_config={"format": {"type": "json_schema", "schema": NOTE_SCHEMA}},
             messages=[{"role": "user", "content": prompt}],
         )
 
         text = next(block.text for block in response.content if block.type == "text")
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-
-        notes = json.loads(text)
-        if not isinstance(notes, list) or len(notes) != len(venues):
-            raise ValueError(f"expected {len(venues)} notes, got {notes!r}")
+        notes = json.loads(text)["notes"]
+        if len(notes) != len(venues):
+            raise ValueError(f"expected {len(venues)} notes, got {len(notes)}")
 
         result = []
         for v, note in zip(venues, notes):
-            note_text = note.get("note") if isinstance(note, dict) else None
+            note_text = note.get("note") or None
             if note_text:
                 note_text = _strip_citations(note_text) or None
             result.append(VenueResult(

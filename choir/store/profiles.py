@@ -5,8 +5,21 @@ from choir.schemas import UserProfile
 DB_PATH = "choir.db"
 
 
+def _connect() -> sqlite3.Connection:
+    # timeout=10: wait up to 10s for a lock instead of failing immediately
+    # with "database is locked" — cheap insurance now that negotiation
+    # logging writes happen mid-negotiation (once per round), not just at
+    # onboarding time, so concurrent access is more likely than it used to be.
+    return sqlite3.connect(DB_PATH, timeout=10)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
+    # WAL allows concurrent readers while a write transaction is open,
+    # instead of the default rollback-journal mode locking the whole file for
+    # the duration of a write — meaningfully reduces contention under the
+    # same "more concurrent writes than before" pressure noted above.
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS profiles (
             telegram_user_id INTEGER PRIMARY KEY,
@@ -39,6 +52,32 @@ def init_db():
         conn.execute("ALTER TABLE seen_members ADD COLUMN first_name TEXT")
     except sqlite3.OperationalError:
         pass
+    # Append-only audit log: every negotiation and every round it ran,
+    # written incrementally as they happen (not just at the end), so a crash
+    # or restart mid-negotiation still leaves a real record instead of total
+    # silent loss. This is an audit trail, not a resume mechanism — recovering
+    # an in-flight negotiation to continue exactly where it left off is a
+    # bigger feature this doesn't attempt.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS negotiations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            goal_text TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            converged INTEGER,
+            decision TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS negotiation_rounds (
+            negotiation_id INTEGER,
+            round_num INTEGER,
+            signals_json TEXT,
+            recorded_at TEXT,
+            PRIMARY KEY (negotiation_id, round_num)
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS calendar_tokens (
             telegram_user_id INTEGER PRIMARY KEY,
@@ -53,7 +92,7 @@ def init_db():
 
 
 def save_profile(profile: UserProfile):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute("""
         INSERT OR REPLACE INTO profiles
             (telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, notes)
@@ -68,7 +107,7 @@ def save_profile(profile: UserProfile):
 
 
 def get_profile(telegram_user_id: int) -> UserProfile | None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     row = conn.execute(
         "SELECT telegram_user_id, budget_min, budget_max, preferences, area, dietary_notes, temporary_context, "
         "notes FROM profiles WHERE telegram_user_id = ?",
@@ -85,14 +124,14 @@ def get_profile(telegram_user_id: int) -> UserProfile | None:
 
 
 def clear_temporary_context(telegram_user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute("UPDATE profiles SET temporary_context = NULL WHERE telegram_user_id = ?", (telegram_user_id,))
     conn.commit()
     conn.close()
 
 
 def record_seen_member(chat_id: int, user_id: int, first_name: str | None = None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         "INSERT OR IGNORE INTO seen_members (chat_id, user_id, first_name) VALUES (?, ?, ?)",
         (chat_id, user_id, first_name),
@@ -111,7 +150,7 @@ def record_seen_member(chat_id: int, user_id: int, first_name: str | None = None
 
 
 def get_seen_members(chat_id: int) -> list[int]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     rows = conn.execute("SELECT user_id FROM seen_members WHERE chat_id = ?", (chat_id,)).fetchall()
     conn.close()
     return [row[0] for row in rows]
@@ -120,10 +159,76 @@ def get_seen_members(chat_id: int) -> list[int]:
 def get_member_name(chat_id: int, user_id: int) -> str:
     # Raw Telegram IDs should never be shown to the group — "Member" is the
     # fallback whenever a name isn't on file for any reason.
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     row = conn.execute(
         "SELECT first_name FROM seen_members WHERE chat_id = ? AND user_id = ?",
         (chat_id, user_id),
     ).fetchone()
     conn.close()
     return row[0] if row and row[0] else "Member"
+
+
+def start_negotiation_log(chat_id: int, goal_text: str) -> int:
+    """Call before run_negotiation(). Returns a negotiation_id to pass to
+    record_negotiation_round() and finish_negotiation_log()."""
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO negotiations (chat_id, goal_text, started_at, converged, decision) "
+        "VALUES (?, ?, datetime('now'), NULL, NULL)",
+        (chat_id, goal_text),
+    )
+    conn.commit()
+    negotiation_id = cursor.lastrowid
+    conn.close()
+    return negotiation_id
+
+
+def record_negotiation_round(negotiation_id: int, round_num: int, signals_json: str):
+    """Written as each round completes, not batched at the end — a crash
+    mid-negotiation still leaves every round up to that point on disk."""
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO negotiation_rounds (negotiation_id, round_num, signals_json, recorded_at) "
+        "VALUES (?, ?, ?, datetime('now'))",
+        (negotiation_id, round_num, signals_json),
+    )
+    conn.commit()
+    conn.close()
+
+
+def finish_negotiation_log(negotiation_id: int, converged: bool, decision: str | None):
+    conn = _connect()
+    conn.execute(
+        "UPDATE negotiations SET finished_at = datetime('now'), converged = ?, decision = ? WHERE id = ?",
+        (int(converged), decision, negotiation_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_negotiation_history(chat_id: int, limit: int = 10) -> list[dict]:
+    """Most recent negotiations for a chat, newest first — the actual
+    auditability payoff: answering "what did we decide last time and why"
+    without relying on Telegram's own message history."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, goal_text, started_at, finished_at, converged, decision FROM negotiations "
+        # Ordered by id, not started_at: started_at has only second-level
+        # granularity (SQLite's datetime('now')), so two negotiations
+        # starting in the same second would tie under a timestamp sort. The
+        # autoincrement id is always strictly increasing regardless.
+        "WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+        (chat_id, limit),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "goal_text": row[1],
+            "started_at": row[2],
+            "finished_at": row[3],
+            "converged": bool(row[4]) if row[4] is not None else None,
+            "decision": row[5],
+        }
+        for row in rows
+    ]

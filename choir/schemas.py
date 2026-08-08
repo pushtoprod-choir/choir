@@ -32,18 +32,6 @@ class AgentSignal:
 
 
 @dataclass
-class NegotiationResult:
-    converged: bool
-    decision: Optional[str]        # e.g. "Cafe Coffee Day, HSR, 7:30pm"
-    explanation: Optional[str]     # e.g. "Chose the cafe over the bar — Rahul's saving money this week"
-    top_options: list[str] = field(default_factory=list)  # populated only if converged == False
-    tradeoffs: list[str] = field(default_factory=list)    # per-person reasons, populated on convergence
-    rounds: list[list[AgentSignal]] = field(default_factory=list)  # every round's signals, always populated —
-                                                                    # lets the bot show the actual back-and-forth,
-                                                                    # not just the final outcome
-
-
-@dataclass
 class VenueQuery:
     purpose: str                   # "casual_lunch" | "drinks" | "work_meeting"
     areas: list[str]               # every involved person's stated area
@@ -59,6 +47,21 @@ class VenueResult:
     lat: float = 0.0
     lon: float = 0.0
     note: Optional[str] = None   # best-effort rating/price/vibe note from enrichment; None if unavailable
+
+
+@dataclass
+class NegotiationResult:
+    converged: bool
+    decision: Optional[str]        # e.g. "Cafe Coffee Day, HSR, 7:30pm"
+    explanation: Optional[str]     # e.g. "Chose the cafe over the bar — Rahul's saving money this week"
+    top_options: list[str] = field(default_factory=list)  # populated only if converged == False
+    tradeoffs: list[str] = field(default_factory=list)    # per-person reasons, populated on convergence
+    rounds: list[list[AgentSignal]] = field(default_factory=list)  # every round's signals, always populated —
+                                                                    # lets the bot show the actual back-and-forth,
+                                                                    # not just the final outcome
+    decided_venue: Optional[VenueResult] = None  # the REAL venue `decision` resolved to, when the negotiation had
+                                                  # real candidates to choose from — None if venues were unavailable
+                                                  # (LocationIQ down/unconfigured) and the decision is still free text
 
 
 @dataclass

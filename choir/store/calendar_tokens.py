@@ -1,12 +1,11 @@
-import sqlite3
 import time
 
 from choir.schemas import CalendarTokens
-from choir.store.profiles import DB_PATH
+from choir.store.profiles import _connect
 
 
 def save_calendar_tokens(telegram_user_id: int, access_token: str, refresh_token: str, token_expiry: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     conn.execute(
         """
         INSERT INTO calendar_tokens (telegram_user_id, access_token, refresh_token, token_expiry, connected_at)
@@ -23,7 +22,7 @@ def save_calendar_tokens(telegram_user_id: int, access_token: str, refresh_token
 
 
 def get_calendar_tokens(telegram_user_id: int) -> CalendarTokens | None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     row = conn.execute(
         "SELECT telegram_user_id, access_token, refresh_token, token_expiry "
         "FROM calendar_tokens WHERE telegram_user_id = ?",
