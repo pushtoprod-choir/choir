@@ -34,9 +34,12 @@ EXTRACTION_SCHEMA = {
 }
 
 
+def _local_tz() -> ZoneInfo:
+    return ZoneInfo(os.environ.get("CHOIR_TIMEZONE", "Asia/Kolkata"))
+
+
 def _local_now_iso() -> str:
-    tz = ZoneInfo(os.environ.get("CHOIR_TIMEZONE", "Asia/Kolkata"))
-    return datetime.now(tz).isoformat()
+    return datetime.now(_local_tz()).isoformat()
 
 
 def extract_event_details(goal_text: str, decision: str) -> EventDetails | None:
@@ -71,10 +74,19 @@ short descriptive phrase if no specific venue is named."""
         )
         text = next(block.text for block in response.content if block.type == "text")
         data = json.loads(text)
-        # Validate start_iso is actually parseable before it goes any further
-        # downstream — catching a malformed-but-plausible string here beats a
-        # confusing crash inside create_event later.
-        datetime.fromisoformat(data["start_iso"])
+        # Normalize start_iso to a timezone-aware, canonical-offset string
+        # before it goes any further downstream — the model is only
+        # prompt-instructed to include a UTC offset, not forced to, and a
+        # naive datetime here silently became a naive dateTime sent to
+        # Google Calendar with no timeZone field, which different
+        # participants' accounts can render at different clock times for
+        # the same event.
+        parsed = datetime.fromisoformat(data["start_iso"])
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_local_tz())
+        else:
+            parsed = parsed.astimezone(_local_tz())
+        data["start_iso"] = parsed.isoformat()
     except (anthropic.APIError, json.JSONDecodeError, KeyError, ValueError, StopIteration):
         return None
 

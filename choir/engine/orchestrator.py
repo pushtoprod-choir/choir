@@ -9,6 +9,7 @@ callback fired once per round for live status updates. Keep this shape stable.
 import logging
 import os
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
@@ -64,13 +65,19 @@ def run_negotiation(request: NegotiationRequest, on_round: Optional[OnRound] = N
     # Every round's signals, kept around so a non-convergent negotiation can
     # still surface the best options it saw instead of just giving up empty.
     history: list[list[AgentSignal]] = []
+    # Previous round's signals, fed into the next round's agent calls so each
+    # person can react to what everyone else actually said/wanted instead of
+    # blindly restating their own favorite against one flattened proposal.
+    previous_signals: list[AgentSignal] | None = None
 
     for round_num in range(max_rounds):
         round_started = time.monotonic()
         signals = _get_signals_for_round(
-            request.profiles, request.goal_text, current_proposal, round_num, max_rounds, candidates
+            request.profiles, request.goal_text, current_proposal, round_num, max_rounds, candidates,
+            previous_signals,
         )
         history.append(signals)
+        previous_signals = signals
         logger.info(
             "Round %d/%d: chat=%s stances=%s (%.2fs)",
             round_num + 1, max_rounds, request.group_chat_id,
@@ -139,16 +146,25 @@ def _get_signals_for_round(
     round_num: int,
     max_rounds: int,
     candidates: list[VenueResult],
+    previous_signals: list[AgentSignal] | None = None,
 ) -> list[AgentSignal]:
     """Fires one get_agent_response call per profile concurrently instead of
     sequentially — each is an independent blocking HTTP call to Claude, so a
     thread pool turns N sequential round-trips into roughly one round-trip's
     worth of wall-clock time. Previously a 5-person group paid 5x the latency
     of a 1-person one, every single round. Order matches `profiles`, not
-    completion order, since futures are submitted and awaited in that order."""
+    completion order, since futures are submitted and awaited in that order.
+
+    previous_signals is last round's full signal list (None on round 0) —
+    each profile gets everyone else's prior signal (its own excluded) as
+    other_signals, so this round's decisions can actually respond to the
+    real conflict instead of one flattened current_proposal string."""
     with ThreadPoolExecutor(max_workers=max(len(profiles), 1)) as pool:
         futures = [
-            pool.submit(get_agent_response, profile, goal_text, current_proposal, round_num, max_rounds, candidates)
+            pool.submit(
+                get_agent_response, profile, goal_text, current_proposal, round_num, max_rounds, candidates,
+                [s for s in previous_signals if s.user_id != profile.telegram_user_id] if previous_signals else None,
+            )
             for profile in profiles
         ]
         return [future.result() for future in futures]
@@ -228,9 +244,12 @@ def _select_next_proposal(current_proposal: str | None, signals: list[AgentSigna
        surviving into the next round gives the holdout a real chance to come
        around under mounting round pressure (see agent.py's round-awareness)
        instead of the group perpetually chasing whoever spoke up last.
-    2. Otherwise, take the first counter-proposal offered this round. Doesn't
-       try to merge or rank multiple simultaneous counters — simplest working
-       version that still keeps the negotiation moving.
+    2. Otherwise, table whichever counter-proposal has the most support this
+       round (a plurality vote), not just whoever's counter happened to sort
+       first in `profiles` order. A live 3-way geographic split showed the
+       old "take counters[0]" rule silently dropping the other two people's
+       counters every round with no memory, so the tabled proposal bounced
+       around based on list order rather than actual group support.
 
     Falls back to current_proposal unchanged if neither rule applies (e.g.
     everyone REJECTed with no alternative offered) — including staying None
@@ -242,9 +261,12 @@ def _select_next_proposal(current_proposal: str | None, signals: list[AgentSigna
             return current_proposal
 
     counters = [s for s in signals if s.stance == "COUNTER" and s.counter_proposal]
-    if counters:
-        return counters[0].counter_proposal
-    return current_proposal
+    if not counters:
+        return current_proposal
+    tally = Counter(c.counter_proposal for c in counters)
+    top_count = max(tally.values())
+    leaders = [name for name, count in tally.items() if count == top_count]
+    return leaders[0] if len(leaders) == 1 else counters[0].counter_proposal
 
 
 def _build_explanation(signals: list[AgentSignal]) -> str:

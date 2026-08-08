@@ -29,7 +29,7 @@ def scripted(responses: dict[tuple[int, str | None], AgentSignal]):
     """Builds a get_agent_response stand-in keyed by (user_id, current_proposal),
     so each test can spell out exactly what every person says on every round."""
 
-    def fake(profile, goal_text, current_proposal, round_num=0, max_rounds=1, candidates=None):
+    def fake(profile, goal_text, current_proposal, round_num=0, max_rounds=1, candidates=None, other_signals=None):
         return responses[(profile.telegram_user_id, current_proposal)]
 
     return fake
@@ -154,7 +154,7 @@ class TestOrchestrator(unittest.TestCase):
         # so its prompt can make holding-out have a real, escalating cost.
         seen_calls: list[tuple[str | None, int, int]] = []
 
-        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None):
+        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
             seen_calls.append((current_proposal, round_num, max_rounds))
             # Always COUNTER with the same option — keeps the loop alive for
             # the full MAX_ROUNDS without ever converging, so every round
@@ -183,7 +183,7 @@ class TestOrchestrator(unittest.TestCase):
         # so the shared scripted() helper (keyed by (user_id, current_proposal))
         # can't distinguish them — this needs round_num too, hence a bespoke
         # stateful fake instead.
-        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None):
+        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
             if current_proposal is None:
                 return {
                     1: AgentSignal(user_id=1, stance="COUNTER", reason="r1", counter_proposal="X"),
@@ -208,6 +208,36 @@ class TestOrchestrator(unittest.TestCase):
 
         self.assertTrue(result.converged)
         self.assertEqual(result.decision, "X")
+
+    @patch("choir.engine.orchestrator.get_agent_response")
+    def test_agents_see_last_rounds_signals_from_everyone_but_themselves(self, mock_get):
+        # Regression test for the "each agent negotiates blind" bug: round 2
+        # calls must receive round 1's signals for the OTHER participants
+        # (never their own), so they can actually respond to the real
+        # conflict instead of reacting to one flattened proposal string.
+        calls_by_round: dict[int, list] = {}
+
+        def fake(profile, goal_text, current_proposal, round_num, max_rounds, candidates=None, other_signals=None):
+            calls_by_round.setdefault(round_num, []).append((profile.telegram_user_id, other_signals))
+            if round_num == 0:
+                return AgentSignal(
+                    user_id=profile.telegram_user_id, stance="COUNTER", reason=f"r1-{profile.telegram_user_id}",
+                    counter_proposal=f"Option{profile.telegram_user_id}",
+                )
+            return AgentSignal(user_id=profile.telegram_user_id, stance="REJECT", reason="r2")
+
+        mock_get.side_effect = fake
+
+        run_negotiation(NegotiationRequest(group_chat_id=0, goal_text="dinner", profiles=[USER_A, USER_B]))
+
+        # Round 1 (index 0): nothing to see yet.
+        self.assertTrue(all(other is None for _, other in calls_by_round[0]))
+        # Round 2 (index 1): each person sees exactly the OTHER person's round-1 signal.
+        round2 = dict(calls_by_round[1])
+        self.assertEqual(len(round2[1]), 1)
+        self.assertEqual(round2[1][0].user_id, 2)
+        self.assertEqual(len(round2[2]), 1)
+        self.assertEqual(round2[2][0].user_id, 1)
 
 
 class TestSelectNextProposal(unittest.TestCase):
@@ -249,6 +279,28 @@ class TestSelectNextProposal(unittest.TestCase):
             AgentSignal(user_id=2, stance="COUNTER", reason="nah", counter_proposal="Cafe Z"),
         ]
         self.assertEqual(_select_next_proposal("Cafe A", signals), "Cafe Z")
+
+    def test_multiple_counters_pick_the_plurality_winner_not_first_in_order(self):
+        # Regression test for a real 3-way geographic split: previously this
+        # always took counters[0] ("Whitefield") regardless of support,
+        # silently dropping the other two counters. With 2 of 3 people
+        # pushing the same alternative, that alternative should win even
+        # though it's not first in signal order.
+        signals = [
+            AgentSignal(user_id=1, stance="COUNTER", reason="a", counter_proposal="Whitefield"),
+            AgentSignal(user_id=2, stance="COUNTER", reason="b", counter_proposal="JP Nagar"),
+            AgentSignal(user_id=3, stance="COUNTER", reason="c", counter_proposal="JP Nagar"),
+        ]
+        self.assertEqual(_select_next_proposal(None, signals), "JP Nagar")
+
+    def test_evenly_split_counters_fall_back_to_first_in_order(self):
+        # No plurality winner (1-1 tie) — falls back to the old deterministic
+        # "first counter" behavior rather than picking arbitrarily.
+        signals = [
+            AgentSignal(user_id=1, stance="COUNTER", reason="a", counter_proposal="Whitefield"),
+            AgentSignal(user_id=2, stance="COUNTER", reason="b", counter_proposal="JP Nagar"),
+        ]
+        self.assertEqual(_select_next_proposal(None, signals), "Whitefield")
 
 
 class TestVerifyDecision(unittest.TestCase):

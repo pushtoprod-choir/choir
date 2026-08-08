@@ -59,6 +59,7 @@ def get_agent_response(
     round_num: int = 0,
     max_rounds: int = 1,
     candidates: list[VenueResult] | None = None,
+    other_signals: list[AgentSignal] | None = None,
 ) -> AgentSignal:
     """
     Represents ONE person's private negotiator reacting to the current state
@@ -79,6 +80,15 @@ def get_agent_response(
     candidates are the real, nearby venues (from choir.venues.places) this
     person may counter-propose — see _build_response_schema. A COUNTER is
     never just invented text when candidates exist; it's always one of these.
+
+    other_signals, when provided, is the *previous* round's AgentSignal for
+    every other participant (never this person's own) — only the fields
+    already shown to the whole group (stance, reason, counter_proposal),
+    never a raw UserProfile. Without this, every agent reacted blind to a
+    single flattened current_proposal string, unaware there was a genuine
+    multi-way split at all; this is what lets one agent's reasoning actually
+    respond to another's stated conflict instead of just restating its own
+    favorite every round.
     """
     candidates = candidates or []
     rounds_left = max_rounds - round_num
@@ -93,6 +103,15 @@ def get_agent_response(
     else:
         venues_block = ""
 
+    if other_signals:
+        other_lines = [
+            f"- {s.stance}: {s.reason}" + (f" (wants: {s.counter_proposal})" if s.counter_proposal else "")
+            for s in other_signals
+        ]
+        others_block = "\nWhat everyone else in the group said last round:\n" + "\n".join(other_lines) + "\n"
+    else:
+        others_block = ""
+
     system_prompt = f"""You represent one person in a group negotiation over what the group should do.
 You know only this person's private preferences below. You never see anyone
 else's budget or constraints, and your "reason" is shown to the whole group,
@@ -105,7 +124,7 @@ Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}
 Additional notes: {profile.notes or "none"}
 Calendar (next 48h): {profile.calendar_busy_text or "not connected - no availability data"}
-{venues_block}
+{others_block}{venues_block}
 This is round {round_num + 1} of {max_rounds}. If the group still hasn't all
 agreed on the same thing by the end of round {max_rounds}, NOBODY gets a
 decision — the plan falls through entirely, which is worse for this person
@@ -125,7 +144,10 @@ Decide your stance on the current proposal:
   right now.
 - COUNTER with one of the exact candidate venue names above (if any are
   listed) — or, if none were provided, a concrete specific alternative
-  described in one short phrase — when it would better fit this person.
+  described in one short phrase — when it would better fit this person. If
+  what everyone else said above shows a real split (e.g. different people
+  pushing different areas or times), factor that in and prefer a genuine
+  middle ground over repeating your own favorite unchanged.
 Otherwise leave "counter_proposal" null.
 
 Also factor in timing. If you have a schedule constraint, say so in your reason.
