@@ -10,10 +10,13 @@ tuning — that's the thing to watch for here, not just "did it crash."
 """
 from dotenv import load_dotenv
 
+# Must run before the choir.engine import below: agent.py builds its Anthropic
+# client at module import time, so ANTHROPIC_API_KEY needs to already be in
+# the environment by then, not after.
+load_dotenv()
+
 from choir.engine.orchestrator import run_negotiation
 from choir.schemas import NegotiationRequest, UserProfile
-
-load_dotenv()  # picks up ANTHROPIC_API_KEY from .env, same as main.py
 
 profiles = [
     UserProfile(

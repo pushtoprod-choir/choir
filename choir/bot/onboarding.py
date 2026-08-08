@@ -2,9 +2,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 from choir.schemas import UserProfile
-from choir.store.profiles import save_profile
+from choir.store.profiles import save_profile, record_seen_member
 
-BUDGET, PREFERENCES, AREA = range(3)
+BUDGET, PREFERENCES, AREA, ANYTHING_ELSE = range(4)
 
 PREFERENCE_OPTIONS = {
     "pref_cafe": "cafe_person",
@@ -59,15 +59,32 @@ async def handle_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    area = update.message.text.strip()
+    context.user_data["area"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Last thing — anything specific about you we should know? "
+        "(dietary needs, a scheduling quirk, whatever's useful — or send \"skip\")"
+    )
+    return ANYTHING_ELSE
+
+
+async def handle_anything_else(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    notes = None if text.lower() == "skip" else text
+
     profile = UserProfile(
         telegram_user_id=update.message.from_user.id,
         budget_min=context.user_data["budget_min"],
         budget_max=context.user_data["budget_max"],
         preferences=context.user_data.get("preferences", []),
-        area=area,
+        area=context.user_data["area"],
+        notes=notes,
     )
     save_profile(profile)
+    # Records/backfills first_name off onboarding (a DM, so there's no real
+    # group chat_id here) so get_member_name resolves correctly in every
+    # group this user is later seen in, even if they never send a fresh
+    # group message after this.
+    record_seen_member(update.effective_chat.id, update.effective_user.id, update.effective_user.first_name)
     await update.message.reply_text(
         f"All set. Budget ₹{profile.budget_min}-₹{profile.budget_max}, "
         f"around {profile.area}. I'll negotiate on your behalf from now on."

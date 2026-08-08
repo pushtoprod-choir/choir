@@ -91,16 +91,20 @@ def _extract_top_options(history: list[list[AgentSignal]]) -> list[str]:
     return options[:2]
 
 
-def format_transcript(rounds: list[list[AgentSignal]]) -> str:
+def format_transcript(rounds: list[list[AgentSignal]], resolve_name: Optional[Callable[[int], str]] = None) -> str:
     """Turns NegotiationResult.rounds into a readable "show your work" block —
     the demo moment that proves the negotiation was real back-and-forth, not
-    a single hidden API call. Pure formatting, no I/O, so it's testable with
-    the same fake AgentSignal objects used everywhere else in this engine."""
+    a single hidden API call. Pure formatting, no I/O by default, so it's
+    testable with the same fake AgentSignal objects used everywhere else in
+    this engine — resolve_name is an optional injected lookup (e.g. the
+    bot layer's get_member_name) so the transcript can show names instead of
+    raw user_ids without this module doing any DB access itself."""
     lines = []
     for round_num, signals in enumerate(rounds):
         lines.append(f"Round {round_num + 1}:")
         for s in signals:
-            line = f"  {s.user_id}: {s.stance} — {s.reason}"
+            name = resolve_name(s.user_id) if resolve_name else s.user_id
+            line = f"  {name}: {s.stance} — {s.reason}"
             if s.counter_proposal:
                 line += f" (proposes: {s.counter_proposal})"
             lines.append(line)

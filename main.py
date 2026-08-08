@@ -1,5 +1,11 @@
 import os
 from dotenv import load_dotenv
+
+# Must run before any choir.* import: choir.engine.agent builds its Anthropic
+# client at module import time, so ANTHROPIC_API_KEY has to already be in the
+# environment by the time that import happens, not after.
+load_dotenv()
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,13 +23,14 @@ from choir.bot.onboarding import (
     handle_budget,
     handle_preferences,
     handle_area,
+    handle_anything_else,
     cancel_onboarding,
     BUDGET,
     PREFERENCES,
     AREA,
+    ANYTHING_ELSE,
 )
 
-load_dotenv()
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 
 
@@ -40,6 +47,7 @@ def main():
             BUDGET: [CallbackQueryHandler(handle_budget, pattern="^budget_")],
             PREFERENCES: [CallbackQueryHandler(handle_preferences, pattern="^pref_")],
             AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_area)],
+            ANYTHING_ELSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_anything_else)],
         },
         fallbacks=[CommandHandler("cancel", cancel_onboarding)],
     )
