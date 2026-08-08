@@ -182,12 +182,18 @@ def _fetch_venue_context(
     like before this feature existed."""
     api_key = os.environ.get("LOCATION_IQ_API_KEY")
     if not api_key:
+        logger.warning("LOCATION_IQ_API_KEY not set; negotiating without real venue grounding")
         return [], {}
     try:
         areas = list({p.area for p in request.profiles})
         area_coords = geocode_areas(areas, api_key)
         query = build_venue_query(request.profiles, request.goal_text)
         candidates = find_venues(query, api_key, area_coords=area_coords)
+        if not candidates:
+            logger.warning(
+                "No venue candidates found: chat=%s areas=%s area_coords=%s",
+                request.group_chat_id, areas, area_coords,
+            )
         return candidates, area_coords
     except Exception:
         logger.warning("Venue lookup failed; negotiating without real venue grounding", exc_info=True)

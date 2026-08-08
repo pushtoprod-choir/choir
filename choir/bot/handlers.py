@@ -19,6 +19,10 @@ from choir.store.profiles import (
     record_negotiation_round,
     finish_negotiation_log,
     get_negotiation_history,
+    start_trip,
+    get_active_trip,
+    end_trip,
+    get_trip_negotiations,
 )
 from choir.schemas import NegotiationRequest, AgentSignal, UserProfile, VenueResult
 from choir.engine.agent import get_missing_info_question
@@ -350,7 +354,9 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not args:
         await message.reply_text(
             "Tell me what you want to plan — e.g. /choir plan lunch for us\n"
-            "Or revise the last plan: /choir update <what changed>",
+            "Or revise the last plan: /choir update <what changed>\n"
+            "Planning something bigger? /choir start trip <optional description> "
+            "then /choir end trip when you're done.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -365,6 +371,50 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if message.chat_id in _pending_occasion:
         await message.reply_text(
             'Still waiting on the occasion for the last /choir — answer that first (or reply "skip").',
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    is_start_trip = len(args) >= 2 and args[0].lower() == "start" and args[1].lower() == "trip"
+    is_end_trip = len(args) >= 2 and args[0].lower() == "end" and args[1].lower() == "trip"
+
+    if is_start_trip:
+        if get_active_trip(message.chat_id) is not None:
+            await message.reply_text(
+                "A trip's already in progress for this group — /choir end trip first.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        title = " ".join(args[2:]).strip() or None
+        start_trip(message.chat_id, message.from_user.id, title)
+        label = f' "{title}"' if title else ""
+        await message.reply_text(
+            f"🧳 Trip started{label}. Every /choir plan from here gets tracked as part of it "
+            "— wrap up with /choir end trip when you're done.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if is_end_trip:
+        active_trip = get_active_trip(message.chat_id)
+        if active_trip is None:
+            await message.reply_text(
+                "No trip in progress for this group.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        trip_negotiations = get_trip_negotiations(active_trip["id"])
+        decided = [n for n in trip_negotiations if n["converged"] and n["decision"]]
+        summary = (
+            "\n".join(f"• {n['goal_text']}: {n['decision']}" for n in decided)
+            if decided
+            else "No decisions were finalized during this trip."
+        )
+        end_trip(active_trip["id"], summary)
+        title = active_trip["title"]
+        label = f' "{title}"' if title else ""
+        await message.reply_text(
+            f"🏁 Trip{label} ended.\n\n*Summary:*\n{summary}",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -522,7 +572,11 @@ async def _run_negotiation(
     # record instead of total silent loss. This is an audit trail, not a
     # resume mechanism: it doesn't make an interrupted negotiation continue
     # from where it left off, only makes it recoverable to look at afterward.
-    negotiation_id = start_negotiation_log(message.chat_id, goal_text)
+    # Auto-tagged to the chat's active trip (if any) so /choir end trip can
+    # later roll up every decision made while it was open.
+    active_trip = get_active_trip(message.chat_id)
+    trip_id = active_trip["id"] if active_trip else None
+    negotiation_id = start_negotiation_log(message.chat_id, goal_text, trip_id=trip_id)
 
     async def on_round(round_num: int, signals: list[AgentSignal]):
         lines = [f"🔁 *Round {round_num + 1}*"]

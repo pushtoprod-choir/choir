@@ -67,5 +67,54 @@ class TestNegotiationLog(unittest.TestCase):
         self.assertEqual(history[1]["decision"], "A")
 
 
+class TestTrips(unittest.TestCase):
+    def setUp(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, path)
+        self._original_db_path = profiles.DB_PATH
+        profiles.DB_PATH = path
+        self.addCleanup(setattr, profiles, "DB_PATH", self._original_db_path)
+        profiles.init_db()
+
+    def test_no_active_trip_by_default(self):
+        self.assertIsNone(profiles.get_active_trip(chat_id=100))
+
+    def test_start_trip_makes_it_the_active_trip(self):
+        trip_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")
+        active = profiles.get_active_trip(chat_id=100)
+        self.assertEqual(active["id"], trip_id)
+        self.assertEqual(active["title"], "Goa")
+
+    def test_negotiations_started_with_a_trip_id_are_linked_to_it(self):
+        trip_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")
+        profiles.start_negotiation_log(chat_id=100, goal_text="plan lunch", trip_id=trip_id)
+        profiles.start_negotiation_log(chat_id=100, goal_text="untagged plan")
+
+        linked = profiles.get_trip_negotiations(trip_id)
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0]["goal_text"], "plan lunch")
+
+    def test_end_trip_clears_active_status_and_stores_summary(self):
+        trip_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")
+        profiles.end_trip(trip_id, summary="• plan lunch: Cafe X")
+
+        self.assertIsNone(profiles.get_active_trip(chat_id=100))
+        history = profiles.get_trip_history(chat_id=100)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "ended")
+        self.assertEqual(history[0]["summary"], "• plan lunch: Cafe X")
+        self.assertIsNotNone(history[0]["ended_at"])
+
+    def test_starting_a_new_trip_after_ending_the_last_one_is_allowed(self):
+        first_id = profiles.start_trip(chat_id=100, started_by=1, title="Goa")
+        profiles.end_trip(first_id, summary=None)
+        second_id = profiles.start_trip(chat_id=100, started_by=1, title="Manali")
+
+        active = profiles.get_active_trip(chat_id=100)
+        self.assertEqual(active["id"], second_id)
+        self.assertNotEqual(first_id, second_id)
+
+
 if __name__ == "__main__":
     unittest.main()
