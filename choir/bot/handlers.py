@@ -18,7 +18,6 @@ from choir.store.profiles import (
     start_negotiation_log,
     record_negotiation_round,
     finish_negotiation_log,
-    get_negotiation_history,
     start_trip,
     get_active_trip,
     end_trip,
@@ -44,10 +43,6 @@ _active_negotiations: set[int] = set()
 # reasonably call for different tradeoffs, and the only way to know which is
 # to ask rather than assume.
 _pending_occasion: dict[int, str] = {}
-
-# chat_id -> the most recent converged decision, so "/choir update <reason>"
-# has something concrete to revise instead of starting blind.
-_last_decision: dict[int, str] = {}
 
 _SKIP_WORDS = {"skip", "none", "no", "n/a", "na", ""}
 
@@ -205,10 +200,10 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not args:
         await message.reply_text(
-            "Tell me what you want to plan — e.g. /choir plan lunch for us\n"
-            "Or revise the last plan: /choir update <what changed>\n"
-            "Planning something bigger? /choir start trip <optional description> "
-            "then /choir end trip when you're done.",
+            "Here's what I understand:\n"
+            "/choir start trip <title> — kick off a new trip\n"
+            "/choir plan <what you want> — negotiate something within the current trip\n"
+            "/choir end trip — wrap up the current trip",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -227,8 +222,23 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    is_start_trip = len(args) >= 2 and args[0].lower() == "start" and args[1].lower() == "trip"
-    is_end_trip = len(args) >= 2 and args[0].lower() == "end" and args[1].lower() == "trip"
+    command = args[0].lower()
+    is_start_trip = command == "start" and len(args) >= 2 and args[1].lower() == "trip"
+    is_end_trip = command == "end" and len(args) >= 2 and args[1].lower() == "trip"
+    is_plan = command == "plan"
+
+    # Only these three forms are recognized — anything else (including the
+    # old "/choir <freeform goal>" and "/choir update <reason>" forms) is
+    # rejected outright rather than guessed at.
+    if not (is_start_trip or is_end_trip or is_plan):
+        await message.reply_text(
+            "I only understand:\n"
+            "/choir start trip <title>\n"
+            "/choir plan <what you want>\n"
+            "/choir end trip",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     if is_start_trip:
         if get_active_trip(message.chat_id) is not None:
@@ -271,7 +281,14 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    is_update = args[0].lower() == "update"
+    # "plan" only makes sense inside a trip — it's the container decisions
+    # get tagged against and rolled up into when the trip ends.
+    if get_active_trip(message.chat_id) is None:
+        await message.reply_text(
+            "Start a trip first — /choir start trip <title> — before planning.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     # /choir itself counts as being "seen" in this chat
     record_seen_member(
@@ -299,46 +316,15 @@ async def handle_choir_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    if is_update:
-        previous = _last_decision.get(message.chat_id)
-        if previous is None:
-            # In-memory state doesn't survive a restart — the persisted log
-            # does. Falls back to it so "/choir update" still works after
-            # the bot process restarts, not just within one continuous run.
-            history = get_negotiation_history(message.chat_id, limit=5)
-            previous = next(
-                (h["decision"] for h in history if h["converged"] and h["decision"]),
-                None,
-            )
-        if previous is None:
-            await message.reply_text(
-                "There's no previous plan for this group to update yet — use /choir <what you want> to start one.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-        reason = " ".join(args[1:]).strip()
-        if not reason:
-            await message.reply_text(
-                "Tell me why it needs to change — e.g. /choir update someone's running late",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-        # Seeded with the old decision so the agents revise instead of
-        # re-negotiating from scratch — an update skips both the occasion
-        # question (the reason for changing already provides that context)
-        # and intent-gating below (an explicit revision command doesn't need
-        # classifying, and a reason like "someone's running late" would very
-        # plausibly fail a "is this a planning request" check on its own).
-        goal_text = (
-            f"We previously agreed on: {previous}. That needs to change because: {reason}. "
-            f"Come up with an updated plan that addresses this."
+    goal_text = " ".join(args[1:]).strip()
+    if not goal_text:
+        await message.reply_text(
+            "Tell me what you want to plan — e.g. /choir plan lunch for us",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        await _run_negotiation(message, goal_text)
         return
 
-    goal_text = " ".join(args)
-
-    # Cheap gate so "/choir what's up" doesn't spin up a full negotiation —
+    # Cheap gate so "/choir plan what's up" doesn't spin up a full negotiation —
     # only actually negotiate when this reads like a genuine planning ask.
     # Runs after the profile checks above (not before) so a group that
     # hasn't onboarded yet gets the onboarding prompt without spending an
@@ -462,8 +448,6 @@ async def _run_negotiation(message, goal_text: str):
     )
 
     if result.converged:
-        # Remembered so a later "/choir update <reason>" has something to revise.
-        _last_decision[message.chat_id] = result.decision
         reply = f"🎉 *Decision:* {result.decision}\n\n{result.explanation}"
         if result.tradeoffs:
             reply += "\n\n*Why:*\n" + "\n".join(f"• {t}" for t in result.tradeoffs)
