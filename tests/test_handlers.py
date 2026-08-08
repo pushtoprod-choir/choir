@@ -55,6 +55,7 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.record_negotiation_round"),
             patch("choir.bot.handlers.finish_negotiation_log"),
             patch("choir.bot.handlers.get_negotiation_history", return_value=[]),
+            patch("choir.bot.handlers.get_active_trip", return_value=None),
             patch("choir.bot.handlers.attach_calendar_availability"),
             patch("choir.bot.handlers.create_events_for_connected", return_value=None),
         ]
@@ -188,6 +189,56 @@ class TestOccasionAndUpdateFlow(unittest.IsolatedAsyncioTestCase):
         self.mock_is_planning.assert_not_called()
         self.mock_run.assert_called_once()
 
+    async def test_start_trip_creates_a_trip_and_blocks_a_second_start(self):
+        with patch("choir.bot.handlers.start_trip", return_value=5) as mock_start_trip:
+            message = make_message(chat_id=100, text="/choir start trip Goa")
+            await handlers.handle_choir_command(make_update(message), make_context(["start", "trip", "Goa"]))
+
+        mock_start_trip.assert_called_once_with(100, 1, "Goa")
+        self.assertIn("trip started", message.reply_text.call_args[0][0].lower())
+        self.mock_run.assert_not_called()
+
+    async def test_start_trip_is_rejected_while_one_is_already_active(self):
+        with patch("choir.bot.handlers.get_active_trip", return_value={"id": 5, "title": "Goa"}), \
+             patch("choir.bot.handlers.start_trip") as mock_start_trip:
+            message = make_message(chat_id=100, text="/choir start trip Goa")
+            await handlers.handle_choir_command(make_update(message), make_context(["start", "trip", "Goa"]))
+
+        mock_start_trip.assert_not_called()
+        self.assertIn("already in progress", message.reply_text.call_args[0][0].lower())
+
+    async def test_end_trip_with_none_active_is_rejected(self):
+        message = make_message(chat_id=100, text="/choir end trip")
+        await handlers.handle_choir_command(make_update(message), make_context(["end", "trip"]))
+
+        self.assertIn("no trip in progress", message.reply_text.call_args[0][0].lower())
+
+    async def test_end_trip_summarizes_converged_decisions_and_closes_it_out(self):
+        trip_negotiations = [
+            {"goal_text": "plan lunch", "converged": True, "decision": "Cafe X"},
+            {"goal_text": "plan dinner", "converged": False, "decision": None},
+        ]
+        with patch("choir.bot.handlers.get_active_trip", return_value={"id": 5, "title": "Goa"}), \
+             patch("choir.bot.handlers.get_trip_negotiations", return_value=trip_negotiations), \
+             patch("choir.bot.handlers.end_trip") as mock_end_trip:
+            message = make_message(chat_id=100, text="/choir end trip")
+            await handlers.handle_choir_command(make_update(message), make_context(["end", "trip"]))
+
+        mock_end_trip.assert_called_once()
+        self.assertEqual(mock_end_trip.call_args[0][0], 5)
+        self.assertIn("Cafe X", mock_end_trip.call_args[0][1])
+        reply = message.reply_text.call_args[0][0]
+        self.assertIn("trip", reply.lower())
+        self.assertIn("Cafe X", reply)
+
+    async def test_negotiation_started_during_an_active_trip_is_tagged_with_its_id(self):
+        with patch("choir.bot.handlers.get_active_trip", return_value={"id": 7, "title": "Goa"}), \
+             patch("choir.bot.handlers.start_negotiation_log", return_value=1) as mock_start_log:
+            message = make_message(chat_id=100, text="/choir plan lunch")
+            await handlers._run_negotiation(message, "plan lunch")
+
+        mock_start_log.assert_called_once_with(100, "plan lunch", trip_id=7)
+
     async def test_redelivered_update_is_processed_only_once(self):
         # Telegram long-polling can redeliver the same update (a documented
         # real behavior) — without this guard, a redelivered /choir would
@@ -247,6 +298,7 @@ class TestConvergedReplyAssembly(unittest.IsolatedAsyncioTestCase):
             patch("choir.bot.handlers.start_negotiation_log", return_value=1),
             patch("choir.bot.handlers.record_negotiation_round"),
             patch("choir.bot.handlers.finish_negotiation_log"),
+            patch("choir.bot.handlers.get_active_trip", return_value=None),
             patch("choir.bot.handlers.attach_calendar_availability"),
         ]
         for p in self.patches:

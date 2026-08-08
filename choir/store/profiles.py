@@ -78,6 +78,31 @@ def init_db():
             PRIMARY KEY (negotiation_id, round_num)
         )
     """)
+    # A trip is a container spanning possibly-multiple negotiations (e.g.
+    # destination, then dates, then venue) between /choir start trip and
+    # /choir end trip. One row per trip; negotiations link back via the
+    # trip_id column added below.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            started_by INTEGER,
+            title TEXT,
+            started_at TEXT,
+            ended_at TEXT,
+            status TEXT,
+            summary TEXT
+        )
+    """)
+    # negotiations may already exist from before trips were added — ALTER
+    # rather than rely on CREATE TABLE IF NOT EXISTS, which won't add columns
+    # to an existing table. NULL trip_id means "not part of any trip" (the
+    # case for every pre-existing row, and for negotiations run outside an
+    # active trip).
+    try:
+        conn.execute("ALTER TABLE negotiations ADD COLUMN trip_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS calendar_tokens (
             telegram_user_id INTEGER PRIMARY KEY,
@@ -168,14 +193,16 @@ def get_member_name(chat_id: int, user_id: int) -> str:
     return row[0] if row and row[0] else "Member"
 
 
-def start_negotiation_log(chat_id: int, goal_text: str) -> int:
+def start_negotiation_log(chat_id: int, goal_text: str, trip_id: int | None = None) -> int:
     """Call before run_negotiation(). Returns a negotiation_id to pass to
-    record_negotiation_round() and finish_negotiation_log()."""
+    record_negotiation_round() and finish_negotiation_log(). trip_id links
+    this negotiation to the chat's active trip, if any — None (the default)
+    means it isn't part of a trip."""
     conn = _connect()
     cursor = conn.execute(
-        "INSERT INTO negotiations (chat_id, goal_text, started_at, converged, decision) "
-        "VALUES (?, ?, datetime('now'), NULL, NULL)",
-        (chat_id, goal_text),
+        "INSERT INTO negotiations (chat_id, goal_text, started_at, converged, decision, trip_id) "
+        "VALUES (?, ?, datetime('now'), NULL, NULL, ?)",
+        (chat_id, goal_text, trip_id),
     )
     conn.commit()
     negotiation_id = cursor.lastrowid
@@ -229,6 +256,94 @@ def get_negotiation_history(chat_id: int, limit: int = 10) -> list[dict]:
             "finished_at": row[3],
             "converged": bool(row[4]) if row[4] is not None else None,
             "decision": row[5],
+        }
+        for row in rows
+    ]
+
+
+def start_trip(chat_id: int, started_by: int, title: str | None) -> int:
+    """Call when /choir start trip is issued. Returns a trip_id to pass to
+    start_negotiation_log() for every negotiation run while this trip is
+    active, and later to end_trip(). Caller is responsible for checking
+    get_active_trip() first — this doesn't itself guard against a second
+    trip starting in the same chat."""
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO trips (chat_id, started_by, title, started_at, status) "
+        "VALUES (?, ?, ?, datetime('now'), 'active')",
+        (chat_id, started_by, title),
+    )
+    conn.commit()
+    trip_id = cursor.lastrowid
+    conn.close()
+    return trip_id
+
+
+def get_active_trip(chat_id: int) -> dict | None:
+    """The chat's currently in-progress trip, if any. Queried fresh from the
+    DB (not cached in memory) so it survives a process restart the same way
+    get_negotiation_history's fallback does."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id, chat_id, started_by, title, started_at FROM trips "
+        "WHERE chat_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (chat_id,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "chat_id": row[1],
+        "started_by": row[2],
+        "title": row[3],
+        "started_at": row[4],
+    }
+
+
+def get_trip_negotiations(trip_id: int) -> list[dict]:
+    """Every negotiation run under a given trip, oldest first — the raw
+    material end_trip() rolls up into a summary."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT goal_text, converged, decision FROM negotiations "
+        "WHERE trip_id = ? ORDER BY id ASC",
+        (trip_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"goal_text": row[0], "converged": bool(row[1]) if row[1] is not None else None, "decision": row[2]}
+        for row in rows
+    ]
+
+
+def end_trip(trip_id: int, summary: str | None):
+    conn = _connect()
+    conn.execute(
+        "UPDATE trips SET ended_at = datetime('now'), status = 'ended', summary = ? WHERE id = ?",
+        (summary, trip_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_trip_history(chat_id: int, limit: int = 10) -> list[dict]:
+    """Most recent trips for a chat, newest first."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, title, started_at, ended_at, status, summary FROM trips "
+        "WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+        (chat_id, limit),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "title": row[1],
+            "started_at": row[2],
+            "ended_at": row[3],
+            "status": row[4],
+            "summary": row[5],
         }
         for row in rows
     ]
