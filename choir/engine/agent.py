@@ -53,6 +53,7 @@ Preferences: {", ".join(profile.preferences) or "none stated"}
 Area: {profile.area}
 Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}
+Calendar (next 48h): {profile.calendar_busy_text or "not connected - no availability data"}
 
 Decide your stance on the current proposal:
 - ACCEPT only if it genuinely fits this person's budget and preferences. If
@@ -66,7 +67,12 @@ Decide your stance on the current proposal:
 Otherwise leave "counter_proposal" null.
 
 Also factor in timing. If you have a schedule constraint, say so in your reason.
-If proposing a COUNTER, include a suggested time alongside the place."""
+If proposing a COUNTER, include a suggested time alongside the place.
+
+If the calendar line above shows a real conflict with the current proposal's
+time, treat it like a hard constraint (REJECT or COUNTER with a different
+time) — but never restate the other event's title or details in your reason,
+same rule as never restating your exact budget numbers."""
 
     if current_proposal:
         user_message = f"The group wants to: {goal_text}\nCurrent proposal on the table: {current_proposal}"

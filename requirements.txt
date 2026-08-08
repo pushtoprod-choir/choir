@@ -2,3 +2,4 @@ python-telegram-bot
 anthropic
 python-dotenv
 requests
+aiohttp

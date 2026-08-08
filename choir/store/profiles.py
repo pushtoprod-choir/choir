@@ -39,6 +39,15 @@ def init_db():
         conn.execute("ALTER TABLE seen_members ADD COLUMN first_name TEXT")
     except sqlite3.OperationalError:
         pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS calendar_tokens (
+            telegram_user_id INTEGER PRIMARY KEY,
+            access_token TEXT,
+            refresh_token TEXT,
+            token_expiry INTEGER,
+            connected_at INTEGER
+        )
+    """)
     conn.commit()
     conn.close()
 

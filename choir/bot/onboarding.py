@@ -1,6 +1,7 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler
 
+from choir.calendar.oauth import generate_auth_url
 from choir.schemas import UserProfile
 from choir.store.profiles import save_profile, record_seen_member
 
@@ -85,9 +86,15 @@ async def handle_anything_else(update: Update, context: ContextTypes.DEFAULT_TYP
     # group this user is later seen in, even if they never send a fresh
     # group message after this.
     record_seen_member(update.effective_chat.id, update.effective_user.id, update.effective_user.first_name)
+
+    keyboard = [[InlineKeyboardButton("Connect Google Calendar", url=generate_auth_url(profile.telegram_user_id))]]
     await update.message.reply_text(
         f"All set. Budget ₹{profile.budget_min}-₹{profile.budget_max}, "
-        f"around {profile.area}. I'll negotiate on your behalf from now on."
+        f"around {profile.area}. I'll negotiate on your behalf from now on.\n\n"
+        "One optional extra: connect your Google Calendar so I know when you're actually free "
+        "(never a blocker — skip it and everything still works). You can always do this later "
+        "with /connect_calendar too.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     context.user_data.clear()
     return ConversationHandler.END
