@@ -53,6 +53,7 @@ Preferences: {", ".join(profile.preferences) or "none stated"}
 Area: {profile.area}
 Dietary notes: {profile.dietary_notes or "none"}
 Temporary context: {profile.temporary_context or "none"}
+Additional notes: {profile.notes or "none"}
 Calendar (next 48h): {profile.calendar_busy_text or "not connected - no availability data"}
 
 Decide your stance on the current proposal:

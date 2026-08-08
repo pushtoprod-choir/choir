@@ -28,11 +28,13 @@ from choir.bot.onboarding import (
     handle_budget,
     handle_preferences,
     handle_area,
+    handle_dietary,
     handle_anything_else,
     cancel_onboarding,
     BUDGET,
     PREFERENCES,
     AREA,
+    DIETARY,
     ANYTHING_ELSE,
 )
 from choir.calendar.server import build_web_app
@@ -55,6 +57,7 @@ async def main():
             BUDGET: [CallbackQueryHandler(handle_budget, pattern="^budget_")],
             PREFERENCES: [CallbackQueryHandler(handle_preferences, pattern="^pref_")],
             AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_area)],
+            DIETARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_dietary)],
             ANYTHING_ELSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_anything_else)],
         },
         fallbacks=[CommandHandler("cancel", cancel_onboarding)],

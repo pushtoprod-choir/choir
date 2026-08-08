@@ -16,6 +16,10 @@ GEOCODE_URL = "https://us1.locationiq.com/v1/search"
 NEARBY_URL = "https://us1.locationiq.com/v1/nearby"
 SEARCH_RADIUS_METERS = 2000
 REQUEST_TIMEOUT_SECONDS = 10
+# How many venues to ask LocationIQ for. The display side (handlers.py) has
+# its own length guard against Telegram's message cap, so this can be tuned
+# up without risking a repeat of the "message too long" crash.
+NEARBY_RESULTS_LIMIT = 8
 
 # purpose -> LocationIQ nearby "tag" filter. Simplest working version, same
 # spirit as the keyword_map in plan.md's Phase 5 sketch.
@@ -99,7 +103,7 @@ def find_venues(query: VenueQuery, api_key: str) -> list[VenueResult]:
                 "lon": midpoint_lon,
                 "tag": PURPOSE_TAGS.get(query.purpose, PURPOSE_TAGS[DEFAULT_PURPOSE]),
                 "radius": SEARCH_RADIUS_METERS,
-                "limit": 5,
+                "limit": NEARBY_RESULTS_LIMIT,
                 "dedupe": 1,
                 "format": "json",
             },
